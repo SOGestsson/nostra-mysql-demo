@@ -1,0 +1,14 @@
+services:
+  api:
+    build:
+      context: .
+    container_name: nostra_mysql_json_api
+    ports:
+      - "8000:8000"
+    environment:
+      MYSQL_HOST: ${MYSQL_HOST:-host.docker.internal}
+      MYSQL_PORT: ${MYSQL_PORT:-4406}
+      MYSQL_USER: ${MYSQL_USER:-root}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Superman}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-drill_project}
+    restart: unless-stopped
