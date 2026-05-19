@@ -20,28 +20,61 @@ class ColumnInfo:
     extra: str
 
 
-def get_connection() -> MySQLConnection:
+def _get_db_config(name: str) -> dict:
+    master = mysql.connector.connect(
+        host=os.getenv("MASTER_DB_HOST", "raspberrypi.local"),
+        port=int(os.getenv("MASTER_DB_PORT", "4406")),
+        user=os.getenv("MASTER_DB_USER", "root"),
+        password=os.getenv("MASTER_DB_PASSWORD", "Superman"),
+        database="nostradamus_master",
+    )
+    try:
+        with master.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT host, port, database_name, username, password "
+                "FROM database_connections WHERE name = %s LIMIT 1",
+                (name,),
+            )
+            row = cursor.fetchone()
+    finally:
+        master.close()
+    if not row:
+        raise ValueError(f"Unknown database: '{name}'")
+    return row
+
+
+def get_connection(database: str | None = None) -> MySQLConnection:
+    if database:
+        cfg = _get_db_config(database)
+        return mysql.connector.connect(
+            host=cfg["host"],
+            port=cfg["port"],
+            user=cfg["username"],
+            password=cfg["password"],
+            database=cfg["database_name"],
+            autocommit=False,
+        )
     return mysql.connector.connect(
         host=os.getenv("MYSQL_HOST", "raspberrypi.local"),
         port=int(os.getenv("MYSQL_PORT", "4406")),
         user=os.getenv("MYSQL_USER", "root"),
         password=os.getenv("MYSQL_PASSWORD", "Superman"),
-        database=os.getenv("MYSQL_DATABASE", "drill_project"),
+        database=os.getenv("MYSQL_DATABASE", "smart_stock"),
         autocommit=False,
     )
 
 
 @contextmanager
-def connection() -> Iterator[MySQLConnection]:
-    conn = get_connection()
+def connection(database: str | None = None) -> Iterator[MySQLConnection]:
+    conn = get_connection(database)
     try:
         yield conn
     finally:
         conn.close()
 
 
-def list_tables() -> list[str]:
-    with connection() as conn, conn.cursor() as cursor:
+def list_tables(database: str | None = None) -> list[str]:
+    with connection(database) as conn, conn.cursor() as cursor:
         cursor.execute(
             """
             SELECT table_name
@@ -105,8 +138,8 @@ def require_single_primary_key(columns: list[ColumnInfo], table_name: str) -> Co
     return primary_key_columns[0]
 
 
-def list_rows(table_name: str, limit: int, offset: int) -> list[dict[str, Any]]:
-    with connection() as conn:
+def list_rows(table_name: str, limit: int, offset: int, database: str | None = None) -> list[dict[str, Any]]:
+    with connection(database) as conn:
         ensure_table_exists(conn, table_name)
         query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
         with conn.cursor(dictionary=True) as cursor:
@@ -115,8 +148,8 @@ def list_rows(table_name: str, limit: int, offset: int) -> list[dict[str, Any]]:
         return [normalize_row(row) for row in rows]
 
 
-def get_row(table_name: str, row_id: Any) -> dict[str, Any] | None:
-    with connection() as conn:
+def get_row(table_name: str, row_id: Any, database: str | None = None) -> dict[str, Any] | None:
+    with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
         pk_column = require_single_primary_key(columns, table_name)
         query = (
@@ -129,11 +162,11 @@ def get_row(table_name: str, row_id: Any) -> dict[str, Any] | None:
         return normalize_row(row) if row else None
 
 
-def create_row(table_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+def create_row(table_name: str, payload: dict[str, Any], database: str | None = None) -> dict[str, Any]:
     if not payload:
         raise ValueError("Payload must include at least one field")
 
-    with connection() as conn:
+    with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
         valid_columns = {column.name: column for column in columns}
         insertable = {
@@ -163,25 +196,25 @@ def create_row(table_name: str, payload: dict[str, Any]) -> dict[str, Any]:
             pk_column = get_primary_key_columns(columns)
             if len(pk_column) == 1 and "auto_increment" in pk_column[0].extra.lower():
                 row_id = cursor.lastrowid
-                result = get_row(table_name, row_id)
+                result = get_row(table_name, row_id, database)
                 if result:
                     return result
 
         if len(get_primary_key_columns(columns)) == 1:
             pk_name = get_primary_key_columns(columns)[0].name
             if pk_name in data:
-                result = get_row(table_name, data[pk_name])
+                result = get_row(table_name, data[pk_name], database)
                 if result:
                     return result
 
         return data
 
 
-def update_row(table_name: str, row_id: Any, payload: dict[str, Any]) -> dict[str, Any] | None:
+def update_row(table_name: str, row_id: Any, payload: dict[str, Any], database: str | None = None) -> dict[str, Any] | None:
     if not payload:
         raise ValueError("Payload must include at least one field")
 
-    with connection() as conn:
+    with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
         pk_column = require_single_primary_key(columns, table_name)
         data = filter_payload(payload, [column.name for column in columns if column.name != pk_column.name])
@@ -201,11 +234,11 @@ def update_row(table_name: str, row_id: Any, payload: dict[str, Any]) -> dict[st
             if cursor.rowcount == 0:
                 return None
 
-        return get_row(table_name, row_id)
+        return get_row(table_name, row_id, database)
 
 
-def delete_row(table_name: str, row_id: Any) -> bool:
-    with connection() as conn:
+def delete_row(table_name: str, row_id: Any, database: str | None = None) -> bool:
+    with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
         pk_column = require_single_primary_key(columns, table_name)
         query = (
@@ -225,6 +258,7 @@ def get_sim_input_data(
     service_level: float = 0.95,
     start_day: date | None = None,
     end_day: date | None = None,
+    database: str | None = None,
 ) -> dict[str, Any]:
     if number_of_days < 1:
         raise ValueError("number_of_days must be at least 1")
@@ -233,7 +267,7 @@ def get_sim_input_data(
     if not 0 < service_level <= 1:
         raise ValueError("service_level must be greater than 0 and at most 1")
 
-    with connection() as conn:
+    with connection(database) as conn:
         item = _get_single_row(
             conn,
             "SELECT * FROM `items` WHERE `id` = %s",
@@ -241,12 +275,6 @@ def get_sim_input_data(
         )
         if not item:
             raise ValueError(f"Item not found: {item_id}")
-
-        item_editable = _get_single_row(
-            conn,
-            "SELECT * FROM `item_editalbles` WHERE `item_id` = %s",
-            (item_id,),
-        )
 
         history_rows = _get_rows(
             conn,
@@ -314,14 +342,14 @@ def get_sim_input_data(
         sim_rio_items = [
             {
                 "actual_stock": _to_number(item.get("stock_level"), default=0),
-                "buy_freq": _to_number((item_editable or {}).get("buy_freq"), default=0),
-                "del_time": _to_number((item_editable or {}).get("del_time"), default=0),
-                "description": (item_editable or {}).get("description") or item.get("item_number"),
-                "ideal_stock": _to_number((item_editable or {}).get("purchase_suggestion"), default=0),
-                "max": _to_number((item_editable or {}).get("max"), default=0),
-                "min": _to_number((item_editable or {}).get("min"), default=0),
-                "pn": (item_editable or {}).get("item_number") or item.get("item_number"),
-                "purchasing_method": (item_editable or {}).get("purchasing_method") or "",
+                "buy_freq": _to_number(item.get("buy_freq"), default=0),
+                "del_time": _to_number(item.get("del_time"), default=0),
+                "description": item.get("description") or item.get("item_number"),
+                "ideal_stock": _to_number(item.get("purchase_suggestion"), default=0),
+                "max": _to_number(item.get("max"), default=0),
+                "min": _to_number(item.get("min"), default=0),
+                "pn": item.get("item_number"),
+                "purchasing_method": item.get("purchasing_method") or "",
                 "station": item.get("location_name") or item.get("location") or "",
             }
         ]
@@ -342,6 +370,122 @@ def get_sim_input_data(
             "number_of_simulations": number_of_simulations,
             "service_level": service_level,
         }
+
+
+def get_forecast_input_data(
+    item_id: int,
+    forecast_periods: int = 30,
+    mode: str = "local",
+    local_model: str = "auto_arima",
+    season_length: int = 7,
+    freq: str = "D",
+    start_day: date | None = None,
+    end_day: date | None = None,
+    database: str | None = None,
+) -> dict[str, Any]:
+    if forecast_periods < 1:
+        raise ValueError("forecast_periods must be at least 1")
+    if season_length < 1:
+        raise ValueError("season_length must be at least 1")
+
+    with connection(database) as conn:
+        history_rows = _get_rows(
+            conn,
+            """
+            SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+            FROM `item_histories`
+            WHERE `item_id` = %s
+            GROUP BY `consumption_date`
+            ORDER BY `consumption_date`
+            """,
+            (item_id,),
+        )
+
+        if not history_rows:
+            raise ValueError(f"Item not found in item_histories: {item_id}")
+
+        history_dates = [row["consumption_date"] for row in history_rows if row["consumption_date"]]
+        first_history_day = min(history_dates) if history_dates else None
+        last_history_day = max(history_dates) if history_dates else None
+
+        series_start = start_day or first_history_day
+        series_end = end_day or last_history_day
+
+        if not series_start or not series_end:
+            raise ValueError(f"Item history is missing valid consumption_date values: {item_id}")
+        if series_end < series_start:
+            raise ValueError("end_day must be on or after start_day")
+
+        history_by_day = {
+            row["consumption_date"]: int(float(row["actual_sale"] or 0))
+            for row in history_rows
+            if row["consumption_date"] is not None
+        }
+
+        sim_input_his: list[dict[str, Any]] = []
+        current_day = series_start
+        while current_day <= series_end:
+            sim_input_his.append(
+                {
+                    "item_id": item_id,
+                    "actual_sale": history_by_day.get(current_day, 0),
+                    "day": current_day.isoformat(),
+                }
+            )
+            current_day += timedelta(days=1)
+
+        return {
+            "sim_input_his": sim_input_his,
+            "forecast_periods": forecast_periods,
+            "mode": mode,
+            "local_model": local_model,
+            "season_length": season_length,
+            "freq": freq,
+        }
+
+
+def update_purchase_suggestions(suggestions: list[dict[str, Any]], database: str | None = None) -> int:
+    if not suggestions:
+        return 0
+
+    with connection(database) as conn:
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                """
+                UPDATE items
+                SET purchase_suggestion = %(purchase_qty)s,
+                    purch_sugg_creation_date = %(current_datetime)s
+                WHERE id = %(item_id)s
+                """,
+                suggestions,
+            )
+        conn.commit()
+        return sum(1 for s in suggestions if s.get("purchase_qty", 0) is not None)
+
+
+def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
+    if not rows:
+        return 0
+
+    item_ids = list({row["item_id"] for row in rows})
+
+    with connection(database) as conn:
+        with conn.cursor() as cursor:
+            fmt = ",".join(["%s"] * len(item_ids))
+            cursor.execute(f"DELETE FROM sim_result WHERE item_id IN ({fmt})", item_ids)
+
+            cursor.executemany(
+                """
+                INSERT INTO sim_result
+                    (item_id, inv, purchase_qty, deliveries, lost_sale, expired, sim_date, forecast, actual_sale)
+                VALUES
+                    (%(item_id)s, %(inv)s, %(purchase_qty)s, %(deliveries)s, %(lost_sale)s,
+                     %(expired)s, %(sim_date)s, %(forecast)s, %(actual_sale)s)
+                """,
+                rows,
+            )
+        conn.commit()
+        return len(rows)
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:

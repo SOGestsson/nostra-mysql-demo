@@ -2,7 +2,8 @@ services:
   api:
     build:
       context: .
-    container_name: nostra_mysql_json_api
+    image: sogestsson/nostra-mysql-demo-api:latest
+    container_name: nostra_mysql_demo_api
     ports:
       - "8000:8000"
     environment:
@@ -10,5 +11,5 @@ services:
       MYSQL_PORT: ${MYSQL_PORT:-4406}
       MYSQL_USER: ${MYSQL_USER:-root}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Superman}
-      MYSQL_DATABASE: ${MYSQL_DATABASE:-drill_project}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smart_stock}
     restart: unless-stopped
