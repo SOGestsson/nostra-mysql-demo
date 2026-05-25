@@ -56,6 +56,14 @@ def health() -> dict[str, str]:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc.msg}") from exc
 
 
+@app.get("/databases")
+def databases() -> dict[str, list[dict[str, str]]]:
+    try:
+        return {"databases": db.list_active_databases()}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
 @app.get("/tables")
 def tables(db_name: str = Query(default=None, alias="db")) -> dict[str, list[str]]:
     try:

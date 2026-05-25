@@ -32,7 +32,7 @@ def _get_db_config(name: str) -> dict:
         with master.cursor(dictionary=True) as cursor:
             cursor.execute(
                 "SELECT host, port, database_name, username, password "
-                "FROM database_connections WHERE name = %s LIMIT 1",
+                "FROM database_connections WHERE name = %s AND is_active = 1 LIMIT 1",
                 (name,),
             )
             row = cursor.fetchone()
@@ -41,6 +41,25 @@ def _get_db_config(name: str) -> dict:
     if not row:
         raise ValueError(f"Unknown database: '{name}'")
     return row
+
+
+def list_active_databases() -> list[dict[str, str]]:
+    master = mysql.connector.connect(
+        host=os.getenv("MASTER_DB_HOST", "raspberrypi.local"),
+        port=int(os.getenv("MASTER_DB_PORT", "4406")),
+        user=os.getenv("MASTER_DB_USER", "root"),
+        password=os.getenv("MASTER_DB_PASSWORD", "Superman"),
+        database="nostradamus_master",
+    )
+    try:
+        with master.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT name, display_name FROM database_connections WHERE is_active = 1 ORDER BY display_name"
+            )
+            rows = cursor.fetchall()
+    finally:
+        master.close()
+    return [{"name": row["name"], "display_name": row["display_name"] or row["name"]} for row in rows]
 
 
 def get_connection(database: str | None = None) -> MySQLConnection:
@@ -276,17 +295,32 @@ def get_sim_input_data(
         if not item:
             raise ValueError(f"Item not found: {item_id}")
 
-        history_rows = _get_rows(
-            conn,
-            """
-            SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-            FROM `item_histories`
-            WHERE `item_id` = %s
-            GROUP BY `consumption_date`
-            ORDER BY `consumption_date`
-            """,
-            (item_id,),
-        )
+        item_number = item.get("item_number") or ""
+        hist_cols = {c.name for c in get_columns(conn, "item_histories")}
+        if "item_id" in hist_cols:
+            history_rows = _get_rows(
+                conn,
+                """
+                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+                FROM `item_histories`
+                WHERE `item_id` = %s
+                GROUP BY `consumption_date`
+                ORDER BY `consumption_date`
+                """,
+                (item_id,),
+            )
+        else:
+            history_rows = _get_rows(
+                conn,
+                """
+                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+                FROM `item_histories`
+                WHERE `item_number` = %s
+                GROUP BY `consumption_date`
+                ORDER BY `consumption_date`
+                """,
+                (item_number,),
+            )
 
         history_dates = [row["consumption_date"] for row in history_rows if row["consumption_date"]]
         series_end = end_day or date.today()
@@ -313,31 +347,57 @@ def get_sim_input_data(
             )
             current_day += timedelta(days=1)
 
-        on_order_rows = _get_rows(
-            conn,
-            """
-            SELECT `item_id`, `item_number`, `warehouse_name`, `est_deliv_date`, `est_deliv_qty`
-            FROM `on_order`
-            WHERE `item_id` = %s
-            ORDER BY `est_deliv_date`, `id`
-            """,
-            (item_id,),
-        )
-
-        sim_rio_on_order = [
-            {
-                "item_id": row.get("item_id"),
-                "item_number": row.get("item_number") or "",
-                "warehouse_name": row.get("warehouse_name") or "",
-                "est_deliv_date": (
-                    row.get("est_deliv_date").isoformat()
-                    if row.get("est_deliv_date")
-                    else None
-                ),
-                "est_deliv_qty": _to_number(row.get("est_deliv_qty"), default=0),
-            }
-            for row in on_order_rows
-        ]
+        order_cols = {c.name for c in get_columns(conn, "on_order")}
+        if "item_id" in order_cols:
+            on_order_rows = _get_rows(
+                conn,
+                """
+                SELECT `item_id`, `item_number`, `warehouse_name`, `est_deliv_date`, `est_deliv_qty`
+                FROM `on_order`
+                WHERE `item_id` = %s
+                ORDER BY `est_deliv_date`, `id`
+                """,
+                (item_id,),
+            )
+            sim_rio_on_order = [
+                {
+                    "item_id": row.get("item_id"),
+                    "item_number": row.get("item_number") or "",
+                    "warehouse_name": row.get("warehouse_name") or "",
+                    "est_deliv_date": (
+                        row.get("est_deliv_date").isoformat()
+                        if row.get("est_deliv_date")
+                        else None
+                    ),
+                    "est_deliv_qty": _to_number(row.get("est_deliv_qty"), default=0),
+                }
+                for row in on_order_rows
+            ]
+        else:
+            on_order_rows = _get_rows(
+                conn,
+                """
+                SELECT `pn`, `est_deliv_date`, `est_deliv_qty`
+                FROM `on_order`
+                WHERE `pn` = %s
+                ORDER BY `est_deliv_date`, `id`
+                """,
+                (item_number,),
+            )
+            sim_rio_on_order = [
+                {
+                    "item_id": item_id,
+                    "item_number": row.get("pn") or "",
+                    "warehouse_name": "",
+                    "est_deliv_date": (
+                        row.get("est_deliv_date").isoformat()
+                        if row.get("est_deliv_date")
+                        else None
+                    ),
+                    "est_deliv_qty": _to_number(row.get("est_deliv_qty"), default=0),
+                }
+                for row in on_order_rows
+            ]
 
         sim_rio_items = [
             {
@@ -389,17 +449,34 @@ def get_forecast_input_data(
         raise ValueError("season_length must be at least 1")
 
     with connection(database) as conn:
-        history_rows = _get_rows(
-            conn,
-            """
-            SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-            FROM `item_histories`
-            WHERE `item_id` = %s
-            GROUP BY `consumption_date`
-            ORDER BY `consumption_date`
-            """,
-            (item_id,),
-        )
+        hist_cols = {c.name for c in get_columns(conn, "item_histories")}
+        if "item_id" in hist_cols:
+            history_rows = _get_rows(
+                conn,
+                """
+                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+                FROM `item_histories`
+                WHERE `item_id` = %s
+                GROUP BY `consumption_date`
+                ORDER BY `consumption_date`
+                """,
+                (item_id,),
+            )
+        else:
+            item = _get_single_row(conn, "SELECT `item_number` FROM `items` WHERE `id` = %s", (item_id,))
+            if not item:
+                raise ValueError(f"Item not found: {item_id}")
+            history_rows = _get_rows(
+                conn,
+                """
+                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+                FROM `item_histories`
+                WHERE `item_number` = %s
+                GROUP BY `consumption_date`
+                ORDER BY `consumption_date`
+                """,
+                (item.get("item_number"),),
+            )
 
         if not history_rows:
             raise ValueError(f"Item not found in item_histories: {item_id}")
