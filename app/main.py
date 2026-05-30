@@ -204,11 +204,12 @@ def forecast_input(
 def list_rows(
     table_name: str,
     db_name: str = Query(..., alias="db"),
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=100, ge=1, le=20000),
     offset: int = Query(default=0, ge=0),
+    stock_out: bool = Query(default=False),
 ) -> dict[str, Any]:
     try:
-        rows = db.list_rows(table_name=table_name, limit=limit, offset=offset, database=db_name)
+        rows = db.list_rows(table_name=table_name, limit=limit, offset=offset, database=db_name, stock_out=stock_out)
         return {"table": table_name, "count": len(rows), "rows": rows}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
