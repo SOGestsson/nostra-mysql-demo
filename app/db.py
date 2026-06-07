@@ -157,12 +157,17 @@ def require_single_primary_key(columns: list[ColumnInfo], table_name: str) -> Co
     return primary_key_columns[0]
 
 
-def list_rows(table_name: str, limit: int, offset: int, database: str | None = None) -> list[dict[str, Any]]:
+def list_rows(table_name: str, limit: int, offset: int, database: str | None = None, stock_out: bool = False) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, table_name)
-        query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
+        if stock_out:
+            query = f"SELECT * FROM {quote_ident(table_name)} WHERE stock_level <= 0 OR stock_level IS NULL"
+            params: tuple = ()
+        else:
+            query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
+            params = (limit, offset)
         with conn.cursor(dictionary=True) as cursor:
-            cursor.execute(query, (limit, offset))
+            cursor.execute(query, params)
             rows = cursor.fetchall()
         return [normalize_row(row) for row in rows]
 
@@ -250,8 +255,6 @@ def update_row(table_name: str, row_id: Any, payload: dict[str, Any], database: 
         with conn.cursor() as cursor:
             cursor.execute(query, tuple(data.values()) + (row_id,))
             conn.commit()
-            if cursor.rowcount == 0:
-                return None
 
         return get_row(table_name, row_id, database)
 
@@ -620,3 +623,19 @@ def filter_payload(payload: dict[str, Any], valid_column_names: Any) -> dict[str
 
 def quote_ident(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
+
+
+def get_table_ddl(table_name: str, database: str | None = None) -> str:
+    with connection(database) as conn:
+        ensure_table_exists(conn, table_name)
+        with conn.cursor() as cursor:
+            cursor.execute(f"SHOW CREATE TABLE {quote_ident(table_name)}")
+            row = cursor.fetchone()
+    return str(row[1])
+
+
+def execute_ddl(sql: str, database: str | None = None) -> None:
+    with connection(database) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql)
+        conn.commit()

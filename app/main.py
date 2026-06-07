@@ -5,11 +5,11 @@ from datetime import date
 from typing import Any
 
 import mysql.connector
-from fastapi import FastAPI, HTTPException, Query, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import db
+from app import db, auth as auth_module
 
 
 class PurchaseSuggestion(BaseModel):
@@ -35,7 +35,30 @@ class MultiSimResult(BaseModel):
     purchase_suggestions: list[Any] = []
 
 
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    database_name: str
+    is_admin: bool = False
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
 app = FastAPI(title="Nostra MySQL CRUD API")
+
+class DbUiConfigPayload(BaseModel):
+    editableColumns: list[str] = []
+    visibleColumns: list[str] = []
+    filterableColumns: list[str] = []
+
+
+@app.on_event("startup")
+def startup() -> None:
+    auth_module.ensure_users_table()
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,6 +66,113 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest) -> dict:
+    try:
+        user = auth_module.register_user(
+            username=payload.username,
+            email=payload.email,
+            password=payload.password,
+            database_name=payload.database_name,
+            is_admin=payload.is_admin,
+        )
+        return {"user": user}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/admin/users")
+def admin_list_users(authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        return {"users": auth_module.list_users()}
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/admin/users", status_code=status.HTTP_201_CREATED)
+def admin_create_user(payload: RegisterRequest, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        user = auth_module.register_user(
+            username=payload.username,
+            email=payload.email,
+            password=payload.password,
+            database_name=payload.database_name,
+            is_admin=payload.is_admin,
+        )
+        return {"user": user}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/db-config/{db_name}")
+def get_db_config(db_name: str, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        return {"db_name": db_name, "config": auth_module.get_db_ui_config(db_name)}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.put("/admin/db-config/{db_name}")
+def set_db_config(
+    db_name: str,
+    payload: DbUiConfigPayload,
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        config = payload.model_dump()
+        auth_module.set_db_ui_config(db_name, config)
+        return {"db_name": db_name, "config": config}
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def admin_delete_user(user_id: int, authorization: str = Header(default="")) -> Response:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        deleted = auth_module.delete_user(user_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="User not found")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/auth/login")
+def login(payload: LoginRequest) -> dict:
+    try:
+        return auth_module.login_user(email=payload.email, password=payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/vendor-names")
+def vendor_names(db_name: str = Query(..., alias="db")) -> dict[str, list]:
+    try:
+        with db.connection(db_name) as conn:
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute("SELECT vendor_name FROM vendor_info ORDER BY vendor_name")
+                rows = cursor.fetchall()
+        return {"vendor_names": [r["vendor_name"] for r in rows]}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 
 @app.get("/health")
@@ -60,6 +190,24 @@ def health() -> dict[str, str]:
 def databases() -> dict[str, list[dict[str, str]]]:
     try:
         return {"databases": db.list_active_databases()}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/tables/{table_name}/columns")
+def get_table_columns(
+    table_name: str,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, list[str]]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        with db.connection(db_name) as conn:
+            columns = db.get_columns(conn, table_name)
+        return {"columns": [c.name for c in columns]}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
@@ -196,6 +344,38 @@ def forecast_input(
         message = str(exc)
         status_code = 404 if message.startswith("Item not found") else 400
         raise HTTPException(status_code=status_code, detail=message) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/tables/{table_name}/ddl")
+def get_table_ddl(
+    table_name: str,
+    db_name: str = Query(..., alias="db"),
+) -> dict[str, str]:
+    try:
+        ddl = db.get_table_ddl(table_name=table_name, database=db_name)
+        return {"table": table_name, "ddl": ddl}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/tables/{table_name}/ddl")
+def execute_ddl(
+    table_name: str,
+    payload: dict[str, str],
+    db_name: str = Query(..., alias="db"),
+) -> dict[str, str]:
+    try:
+        sql = payload.get("sql", "")
+        if not sql:
+            raise HTTPException(status_code=400, detail="Missing 'sql' in payload")
+        db.execute_ddl(sql=sql, database=db_name)
+        return {"status": "ok", "table": table_name}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
