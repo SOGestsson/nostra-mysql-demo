@@ -28,6 +28,7 @@ deploy.sh
 
 # Generated data
 *.json
+!config/*.example.json
 
 # Docker
 *.tar

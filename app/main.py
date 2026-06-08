@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app import db, auth as auth_module
+from app import db, auth as auth_module, ui_config as ui_config_module
 
 
 class PurchaseSuggestion(BaseModel):
@@ -49,13 +49,6 @@ class LoginRequest(BaseModel):
 
 
 app = FastAPI(title="Nostra MySQL CRUD API")
-
-class DbUiConfigPayload(BaseModel):
-    editableColumns: list[str] = []
-    visibleColumns: list[str] = []
-    filterableColumns: list[str] = []
-    visiblePages: list[str] = []
-
 
 class VendorOverridePayload(BaseModel):
     vendor_name: str
@@ -169,17 +162,19 @@ def set_user_db_config(
 @app.put("/admin/db-config/{db_name}")
 def set_db_config(
     db_name: str,
-    payload: DbUiConfigPayload,
+    payload: ui_config_module.DbUiConfigPayload,
     authorization: str = Header(default=""),
 ) -> dict:
     token = authorization.removeprefix("Bearer ").strip()
     try:
         auth_module.require_admin(token)
-        config = payload.model_dump()
+        config = ui_config_module.validate_db_ui_config(payload.model_dump(), db_name)
         auth_module.set_db_ui_config(db_name, config)
         return {"db_name": db_name, "config": config}
     except ValueError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        message = str(exc)
+        status_code = 403 if message == "Admin access required" else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
 
 
 @app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -259,15 +254,52 @@ def get_table_columns(
     table_name: str,
     db_name: str = Query(..., alias="db"),
     authorization: str = Header(default=""),
-) -> dict[str, list[str]]:
+) -> dict[str, Any]:
     token = authorization.removeprefix("Bearer ").strip()
     try:
         auth_module.verify_token(token)
         with db.connection(db_name) as conn:
             columns = db.get_columns(conn, table_name)
-        return {"columns": [c.name for c in columns]}
+        return {
+            "columns": [c.name for c in columns],
+            "column_meta": [
+                {
+                    "name": c.name,
+                    "data_type": c.data_type,
+                    "is_nullable": c.is_nullable,
+                    "column_key": c.column_key,
+                }
+                for c in columns
+            ],
+        }
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/lookup-options")
+def lookup_options(
+    table: str = Query(...),
+    value_column: str = Query(...),
+    label_column: str | None = Query(default=None),
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, list[dict[str, str]]]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        options = db.get_lookup_options(
+            table_name=table,
+            value_column=value_column,
+            label_column=label_column,
+            database=db_name,
+        )
+        return {"options": options}
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 401 if message in ("Token expired", "Invalid token") else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 

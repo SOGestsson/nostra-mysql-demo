@@ -667,6 +667,37 @@ def filter_payload(payload: dict[str, Any], valid_column_names: Any) -> dict[str
     return {key: value for key, value in payload.items() if key in valid}
 
 
+def get_lookup_options(
+    table_name: str,
+    value_column: str,
+    label_column: str | None = None,
+    database: str | None = None,
+) -> list[dict[str, str]]:
+    label_col = label_column or value_column
+    with connection(database) as conn:
+        columns = ensure_table_exists(conn, table_name)
+        valid_names = {c.name for c in columns}
+        if value_column not in valid_names:
+            raise ValueError(f"Column not found: {value_column}")
+        if label_col not in valid_names:
+            raise ValueError(f"Column not found: {label_col}")
+
+        query = (
+            f"SELECT DISTINCT {quote_ident(value_column)} AS value, "
+            f"{quote_ident(label_col)} AS label "
+            f"FROM {quote_ident(table_name)} "
+            f"WHERE {quote_ident(value_column)} IS NOT NULL "
+            f"ORDER BY {quote_ident(label_col)}"
+        )
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+    return [
+        {"value": str(row["value"]), "label": str(row["label"])}
+        for row in rows
+    ]
+
+
 def quote_ident(value: str) -> str:
     return "`" + value.replace("`", "``") + "`"
 

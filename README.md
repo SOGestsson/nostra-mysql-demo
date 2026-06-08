@@ -112,6 +112,20 @@ API: `http://raspberrypi.local:8001/docs`
 - `POST /sim-result?db=`
 - `POST /purchase-suggestions?db=`
 
+### UI config og lookup
+
+- `GET /db-config/{db_name}` — admin UI stillingar (krefst JWT)
+- `GET /user/db-config/{db_name}` — sameinað admin + notenda stillingar
+- `PUT /admin/db-config/{db_name}` — setja editable dálka, columnEditors, catalogTable
+- `GET /tables/{table_name}/columns?db=` — dálkheiti + `data_type` metadata
+- `GET /lookup-options?db=&table=&value_column=&label_column=` — dropdown valmöguleikar
+
+Dæmi um consumables config: [`config/consumables_ui_config.example.json`](config/consumables_ui_config.example.json)
+
+```bash
+ADMIN_TOKEN=<admin-jwt> DB_NAME=consumables ./scripts/set_consumables_config.sh
+```
+
 ### Annað
 
 - `GET /vendor-names?db=`

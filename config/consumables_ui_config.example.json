@@ -1,0 +1,14 @@
+{
+  "editableColumns": ["purchase_suggestion", "vendor_name"],
+  "columnEditors": {
+    "purchase_suggestion": { "type": "native" },
+    "vendor_name": {
+      "type": "lookup",
+      "table": "vendor_info",
+      "valueColumn": "vendor_name",
+      "labelColumn": "vendor_name",
+      "save": "override"
+    }
+  },
+  "catalogTable": "items"
+}
