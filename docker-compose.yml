@@ -10,6 +10,11 @@ services:
       MYSQL_HOST: ${MYSQL_HOST:-host.docker.internal}
       MYSQL_PORT: ${MYSQL_PORT:-4406}
       MYSQL_USER: ${MYSQL_USER:-root}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-Superman}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-smart_stock}
+      MASTER_DB_HOST: ${MASTER_DB_HOST:-host.docker.internal}
+      MASTER_DB_PORT: ${MASTER_DB_PORT:-4406}
+      MASTER_DB_USER: ${MASTER_DB_USER:-root}
+      MASTER_DB_PASSWORD: ${MASTER_DB_PASSWORD:-${MYSQL_PASSWORD}}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
     restart: unless-stopped

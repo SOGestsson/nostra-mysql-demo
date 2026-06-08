@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone, timedelta
 
@@ -9,7 +10,12 @@ import mysql.connector
 
 from app import db
 
-JWT_SECRET = os.getenv("JWT_SECRET", "nostradamus-secret-key")
+logger = logging.getLogger(__name__)
+_DEFAULT_JWT_SECRET = "nostradamus-secret-key"
+JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)
+
+if JWT_SECRET == _DEFAULT_JWT_SECRET:
+    logger.warning("JWT_SECRET not set — using insecure default; set JWT_SECRET in production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24 * 7  # 1 week
 
