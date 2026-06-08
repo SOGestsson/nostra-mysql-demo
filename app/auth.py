@@ -58,6 +58,17 @@ def ensure_users_table() -> None:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_ui_config (
+                    user_id INT NOT NULL,
+                    db_name VARCHAR(100) NOT NULL,
+                    config_json TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, db_name)
+                )
+                """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -198,6 +209,38 @@ def set_db_ui_config(db_name: str, config: dict) -> None:
                 "INSERT INTO db_ui_config (db_name, config_json) VALUES (%s, %s) "
                 "ON DUPLICATE KEY UPDATE config_json = VALUES(config_json)",
                 (db_name, json.dumps(config)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_ui_config(user_id: int, db_name: str) -> dict:
+    import json
+    conn = _master_conn()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT config_json FROM user_ui_config WHERE user_id = %s AND db_name = %s",
+                (user_id, db_name),
+            )
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    return json.loads(row["config_json"])
+
+
+def set_user_ui_config(user_id: int, db_name: str, config: dict) -> None:
+    import json
+    conn = _master_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO user_ui_config (user_id, db_name, config_json) VALUES (%s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE config_json = VALUES(config_json)",
+                (user_id, db_name, json.dumps(config)),
             )
         conn.commit()
     finally:

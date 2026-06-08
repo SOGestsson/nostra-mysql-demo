@@ -157,15 +157,61 @@ def require_single_primary_key(columns: list[ColumnInfo], table_name: str) -> Co
     return primary_key_columns[0]
 
 
+def _ensure_vendor_overrides_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_overrides (
+                item_id INT NOT NULL PRIMARY KEY,
+                vendor_name VARCHAR(255) NOT NULL,
+                set_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+    conn.commit()
+
+
+def set_vendor_override(item_id: int, vendor_name: str, database: str | None = None) -> None:
+    with connection(database) as conn:
+        _ensure_vendor_overrides_table(conn)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO vendor_overrides (item_id, vendor_name, set_at)
+                VALUES (%s, %s, NOW())
+                ON DUPLICATE KEY UPDATE vendor_name = VALUES(vendor_name), set_at = NOW()
+                """,
+                (item_id, vendor_name),
+            )
+        conn.commit()
+
+
 def list_rows(table_name: str, limit: int, offset: int, database: str | None = None, stock_out: bool = False) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, table_name)
-        if stock_out:
-            query = f"SELECT * FROM {quote_ident(table_name)} WHERE stock_level <= 0 OR stock_level IS NULL"
-            params: tuple = ()
+        if table_name == 'items':
+            _ensure_vendor_overrides_table(conn)
+            join = (
+                "LEFT JOIN vendor_overrides vo "
+                "ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL 30 DAY)"
+            )
+            select = (
+                "SELECT items.*, "
+                "COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name, "
+                "vo.set_at AS vendor_override_set_at "
+                f"FROM items {join}"
+            )
+            if stock_out:
+                query = f"{select} WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
+                params: tuple = ()
+            else:
+                query = f"{select} LIMIT %s OFFSET %s"
+                params = (limit, offset)
         else:
-            query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
-            params = (limit, offset)
+            if stock_out:
+                query = f"SELECT * FROM {quote_ident(table_name)} WHERE stock_level <= 0 OR stock_level IS NULL"
+                params = ()
+            else:
+                query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
+                params = (limit, offset)
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(query, params)
             rows = cursor.fetchall()
