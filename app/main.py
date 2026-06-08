@@ -54,6 +54,16 @@ class DbUiConfigPayload(BaseModel):
     editableColumns: list[str] = []
     visibleColumns: list[str] = []
     filterableColumns: list[str] = []
+    visiblePages: list[str] = []
+
+
+class VendorOverridePayload(BaseModel):
+    vendor_name: str
+
+
+class UserDbConfigPayload(BaseModel):
+    visibleColumns: list[str] = []
+    filterableColumns: list[str] = []
 
 
 @app.on_event("startup")
@@ -124,6 +134,38 @@ def get_db_config(db_name: str, authorization: str = Header(default="")) -> dict
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
+@app.get("/user/db-config/{db_name}")
+def get_user_db_config(db_name: str, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        user = auth_module.verify_token(token)
+        admin_config = auth_module.get_db_ui_config(db_name)
+        user_config = auth_module.get_user_ui_config(user["id"], db_name)
+        merged = {
+            **admin_config,
+            **({"visibleColumns": user_config["visibleColumns"]} if "visibleColumns" in user_config else {}),
+            **({"filterableColumns": user_config["filterableColumns"]} if "filterableColumns" in user_config else {}),
+        }
+        return {"db_name": db_name, "config": merged, "admin_config": admin_config}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.put("/user/db-config/{db_name}")
+def set_user_db_config(
+    db_name: str,
+    payload: UserDbConfigPayload,
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        user = auth_module.verify_token(token)
+        auth_module.set_user_ui_config(user["id"], db_name, payload.model_dump())
+        return {"db_name": db_name, "config": payload.model_dump()}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
 @app.put("/admin/db-config/{db_name}")
 def set_db_config(
     db_name: str,
@@ -157,6 +199,24 @@ def admin_delete_user(user_id: int, authorization: str = Header(default="")) -> 
 def login(payload: LoginRequest) -> dict:
     try:
         return auth_module.login_user(email=payload.email, password=payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.put("/items/{item_id}/vendor-override")
+def set_vendor_override(
+    item_id: int,
+    payload: VendorOverridePayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        db.set_vendor_override(item_id, payload.vendor_name, db_name)
+        return {"item_id": item_id, "vendor_name": payload.vendor_name}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
