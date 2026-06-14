@@ -184,11 +184,20 @@ def set_vendor_override(item_id: int, vendor_name: str, database: str | None = N
         conn.commit()
 
 
+def _ensure_po_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM `items` LIKE 'po'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE `items` ADD COLUMN `po` VARCHAR(200) NULL DEFAULT NULL")
+    conn.commit()
+
+
 def list_rows(table_name: str, limit: int, offset: int, database: str | None = None, stock_out: bool = False) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, table_name)
         if table_name == 'items':
             _ensure_vendor_overrides_table(conn)
+            _ensure_po_column(conn)
             join = (
                 "LEFT JOIN vendor_overrides vo "
                 "ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL 30 DAY)"
