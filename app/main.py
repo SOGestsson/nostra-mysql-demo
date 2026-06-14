@@ -366,6 +366,22 @@ def save_purchase_suggestions(
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 
+@app.post("/purchase-suggestions/reset", status_code=status.HTTP_200_OK)
+def reset_purchase_suggestions(
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        count = db.reset_purchase_suggestions(database=db_name)
+        return {"updated": count}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
 @app.get("/sim-prep")
 def sim_prep(
     item_ids: list[int] = Query(...),

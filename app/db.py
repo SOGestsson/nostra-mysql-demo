@@ -589,6 +589,15 @@ def update_purchase_suggestions(suggestions: list[dict[str, Any]], database: str
         return sum(1 for s in suggestions if s.get("purchase_qty", 0) is not None)
 
 
+def reset_purchase_suggestions(database: str | None = None) -> int:
+    with connection(database) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("UPDATE items SET purchase_suggestion = 0")
+            count = cursor.rowcount
+        conn.commit()
+        return count
+
+
 def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
     if not rows:
         return 0
