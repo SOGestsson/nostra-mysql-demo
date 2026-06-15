@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ from typing import Any, Iterator
 
 import mysql.connector
 from mysql.connector import MySQLConnection
+
+DEFAULT_VENDOR_OVERRIDE_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,35 @@ def _get_db_config(name: str) -> dict:
     if not row:
         raise ValueError(f"Unknown database: '{name}'")
     return row
+
+
+def _get_vendor_override_days(name: str | None) -> int:
+    if not name:
+        return DEFAULT_VENDOR_OVERRIDE_DAYS
+
+    master = mysql.connector.connect(
+        host=os.getenv("MASTER_DB_HOST", "raspberrypi.local"),
+        port=int(os.getenv("MASTER_DB_PORT", "4406")),
+        user=os.getenv("MASTER_DB_USER", "root"),
+        password=os.getenv("MASTER_DB_PASSWORD", "Superman"),
+        database="nostradamus_master",
+    )
+    try:
+        with master.cursor(dictionary=True) as cursor:
+            cursor.execute("SELECT config_json FROM db_ui_config WHERE db_name = %s", (name,))
+            row = cursor.fetchone()
+    finally:
+        master.close()
+
+    if not row:
+        return DEFAULT_VENDOR_OVERRIDE_DAYS
+
+    try:
+        days = int(json.loads(row["config_json"]).get("vendorOverrideDays", DEFAULT_VENDOR_OVERRIDE_DAYS))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return DEFAULT_VENDOR_OVERRIDE_DAYS
+
+    return max(0, min(days, 3650))
 
 
 def list_active_databases() -> list[dict[str, str]]:
@@ -198,9 +230,10 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
         if table_name == 'items':
             _ensure_vendor_overrides_table(conn)
             _ensure_po_column(conn)
+            vendor_override_days = _get_vendor_override_days(database)
             join = (
                 "LEFT JOIN vendor_overrides vo "
-                "ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL 30 DAY)"
+                f"ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL {vendor_override_days} DAY)"
             )
             select = (
                 "SELECT items.*, "

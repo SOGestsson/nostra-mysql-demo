@@ -34,6 +34,7 @@ class DbUiConfigPayload(BaseModel):
     visiblePages: list[str] = []
     columnEditors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     catalogTable: str = "items"
+    vendorOverrideDays: int = Field(default=30, ge=0, le=3650)
 
 
 def _parse_editor(raw: dict[str, Any]) -> ColumnEditorConfig:
