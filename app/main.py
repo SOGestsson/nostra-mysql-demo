@@ -54,9 +54,27 @@ class VendorOverridePayload(BaseModel):
     vendor_name: str
 
 
+class CreateOrderFromSuggestionsPayload(BaseModel):
+    description: str | None = None
+
+
 class UserDbConfigPayload(BaseModel):
-    visibleColumns: list[str] = []
-    filterableColumns: list[str] = []
+    visibleColumns: list[str] | None = None
+    filterableColumns: list[str] | None = None
+    ordersVisibleColumns: list[str] | None = None
+    ordersFilterableColumns: list[str] | None = None
+    columnWidths: dict[str, int] | None = None
+    ordersColumnWidths: dict[str, int] | None = None
+    catalogGridPaging: str | None = None
+    ordersGridPaging: str | None = None
+
+
+class ManualVendorPayload(BaseModel):
+    vendor_name: str
+
+
+class ReplaceSyncedVendorsPayload(BaseModel):
+    vendor_names: list[str] = []
 
 
 @app.on_event("startup")
@@ -138,6 +156,12 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
             **admin_config,
             **({"visibleColumns": user_config["visibleColumns"]} if "visibleColumns" in user_config else {}),
             **({"filterableColumns": user_config["filterableColumns"]} if "filterableColumns" in user_config else {}),
+            **({"ordersVisibleColumns": user_config["ordersVisibleColumns"]} if "ordersVisibleColumns" in user_config else {}),
+            **({"ordersFilterableColumns": user_config["ordersFilterableColumns"]} if "ordersFilterableColumns" in user_config else {}),
+            **({"columnWidths": user_config["columnWidths"]} if "columnWidths" in user_config else {}),
+            **({"ordersColumnWidths": user_config["ordersColumnWidths"]} if "ordersColumnWidths" in user_config else {}),
+            **({"catalogGridPaging": user_config["catalogGridPaging"]} if "catalogGridPaging" in user_config else {}),
+            **({"ordersGridPaging": user_config["ordersGridPaging"]} if "ordersGridPaging" in user_config else {}),
         }
         return {"db_name": db_name, "config": merged, "admin_config": admin_config}
     except ValueError as exc:
@@ -153,8 +177,11 @@ def set_user_db_config(
     token = authorization.removeprefix("Bearer ").strip()
     try:
         user = auth_module.verify_token(token)
-        auth_module.set_user_ui_config(user["id"], db_name, payload.model_dump())
-        return {"db_name": db_name, "config": payload.model_dump()}
+        existing = auth_module.get_user_ui_config(user["id"], db_name)
+        updates = payload.model_dump(exclude_none=True)
+        merged = {**existing, **updates}
+        auth_module.set_user_ui_config(user["id"], db_name, merged)
+        return {"db_name": db_name, "config": merged}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
@@ -226,6 +253,58 @@ def vendor_names(db_name: str = Query(..., alias="db")) -> dict[str, list]:
                 cursor.execute("SELECT vendor_name FROM vendor_info ORDER BY vendor_name")
                 rows = cursor.fetchall()
         return {"vendor_names": [r["vendor_name"] for r in rows]}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/admin/vendors")
+def admin_list_vendors(
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        return {"vendors": db.list_vendors(database=db_name)}
+    except ValueError as exc:
+        status_code = 403 if "admin" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/admin/vendors", status_code=status.HTTP_201_CREATED)
+def admin_add_manual_vendor(
+    payload: ManualVendorPayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        vendor = db.add_manual_vendor(payload.vendor_name, database=db_name)
+        return {"vendor": vendor}
+    except ValueError as exc:
+        status_code = 403 if "admin" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/admin/vendors/replace-sync")
+def admin_replace_synced_vendors(
+    payload: ReplaceSyncedVendorsPayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_admin(token)
+        stats = db.replace_synced_vendors(payload.vendor_names, database=db_name)
+        return stats
+    except ValueError as exc:
+        status_code = 403 if "admin" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
@@ -376,6 +455,72 @@ def reset_purchase_suggestions(
         auth_module.verify_token(token)
         count = db.reset_purchase_suggestions(database=db_name)
         return {"updated": count}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/orders/from-purchase-suggestions", status_code=status.HTTP_201_CREATED)
+def create_order_from_purchase_suggestions(
+    payload: CreateOrderFromSuggestionsPayload | None = None,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        user = auth_module.verify_token(token)
+        result = db.create_order_from_purchase_suggestions(
+            database=db_name,
+            user_id=user.get("id"),
+            description=payload.description if payload else None,
+        )
+        return {"order": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/orders")
+def list_orders(
+    db_name: str = Query(..., alias="db"),
+    limit: int = Query(default=100, ge=1, le=500),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        orders = db.list_orders(database=db_name, limit=limit)
+        return {"orders": orders}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/orders/{order_id}/items")
+def list_order_items(
+    order_id: int,
+    db_name: str = Query(..., alias="db"),
+    limit: int = Query(default=20000, ge=1, le=20000),
+    offset: int = Query(default=0, ge=0),
+    order_lines_only: bool = Query(default=True),
+    stock_out: bool = Query(default=False),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        rows = db.list_order_items(
+            order_id=order_id,
+            database=db_name,
+            limit=limit,
+            offset=offset,
+            order_lines_only=order_lines_only,
+            stock_out=stock_out,
+        )
+        return {"order_id": order_id, "count": len(rows), "rows": rows}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:

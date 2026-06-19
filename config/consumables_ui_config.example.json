@@ -1,5 +1,5 @@
 {
-  "editableColumns": ["purchase_suggestion", "vendor_name"],
+  "editableColumns": ["purchase_suggestion", "vendor_name", "active_flag"],
   "columnEditors": {
     "purchase_suggestion": { "type": "native" },
     "vendor_name": {
@@ -8,6 +8,10 @@
       "valueColumn": "vendor_name",
       "labelColumn": "vendor_name",
       "save": "override"
+    },
+    "active_flag": {
+      "type": "enum",
+      "options": ["já", "nei"]
     }
   },
   "catalogTable": "items"

@@ -9,6 +9,8 @@ from app import db
 
 class NativeEditorConfig(BaseModel):
     type: Literal["native"] = "native"
+    table: str | None = None
+    column: str | None = None
 
 
 class EnumEditorConfig(BaseModel):
@@ -33,6 +35,7 @@ class DbUiConfigPayload(BaseModel):
     filterableColumns: list[str] = []
     visiblePages: list[str] = []
     columnEditors: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    columnLabels: dict[str, str] = Field(default_factory=dict)
     catalogTable: str = "items"
     vendorOverrideDays: int = Field(default=30, ge=0, le=3650)
 
@@ -55,7 +58,10 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
     column_names = {c.name for c in columns}
 
     for col in payload.editableColumns:
-        if col not in column_names:
+        editor_raw = payload.columnEditors.get(col, {})
+        editor_table = editor_raw.get("table")
+        editor_column = editor_raw.get("column")
+        if col not in column_names and not (editor_table and editor_column):
             raise ValueError(f"Editable column '{col}' not found in table '{catalog_table}'")
 
     validated_editors: dict[str, dict[str, Any]] = {}
@@ -63,7 +69,18 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
         if col not in payload.editableColumns:
             raise ValueError(f"columnEditors key '{col}' must also be listed in editableColumns")
         editor = _parse_editor(raw)
-        if isinstance(editor, EnumEditorConfig):
+        if isinstance(editor, NativeEditorConfig):
+            if editor.table or editor.column:
+                table_name = editor.table or catalog_table
+                column_name = editor.column or col
+                with db.connection(database) as conn:
+                    native_columns = {c.name for c in db.get_columns(conn, table_name)}
+                if column_name not in native_columns:
+                    raise ValueError(
+                        f"native editor for '{col}': column '{column_name}' "
+                        f"not found in table '{table_name}'"
+                    )
+        elif isinstance(editor, EnumEditorConfig):
             if not editor.options:
                 raise ValueError(f"enum editor for '{col}' requires non-empty options")
         elif isinstance(editor, LookupEditorConfig):
@@ -82,4 +99,9 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
 
     result = payload.model_dump()
     result["columnEditors"] = validated_editors
+    result["columnLabels"] = {
+        key: value.strip()
+        for key, value in payload.columnLabels.items()
+        if value and value.strip()
+    }
     return result

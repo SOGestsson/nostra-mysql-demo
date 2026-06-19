@@ -216,12 +216,157 @@ def set_vendor_override(item_id: int, vendor_name: str, database: str | None = N
         conn.commit()
 
 
-def _ensure_po_column(conn: MySQLConnection) -> None:
+def _migrate_po_to_order_lines(conn: MySQLConnection) -> None:
     with conn.cursor() as cursor:
-        cursor.execute("SHOW COLUMNS FROM `items` LIKE 'po'")
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'po'")
         if not cursor.fetchone():
-            cursor.execute("ALTER TABLE `items` ADD COLUMN `po` VARCHAR(200) NULL DEFAULT NULL")
+            cursor.execute("ALTER TABLE order_lines ADD COLUMN po VARCHAR(200) NULL DEFAULT NULL")
+        cursor.execute("SHOW COLUMNS FROM items LIKE 'po'")
+        if cursor.fetchone():
+            cursor.execute(
+                """
+                UPDATE order_lines ol
+                INNER JOIN items i ON ol.item_id = i.id
+                SET ol.po = i.po
+                WHERE i.po IS NOT NULL AND i.po != ''
+                  AND (ol.po IS NULL OR ol.po = '')
+                """
+            )
+            cursor.execute("ALTER TABLE items DROP COLUMN po")
     conn.commit()
+
+
+def _migrate_order_lines_deleted_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'deleted'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN deleted TINYINT NOT NULL DEFAULT 0"
+            )
+    conn.commit()
+
+
+def _migrate_order_lines_status_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'status'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN status VARCHAR(50) NULL DEFAULT NULL"
+            )
+    conn.commit()
+
+
+def _ensure_vendor_info_manual_column(conn: MySQLConnection) -> None:
+    try:
+        columns = {column.name for column in get_columns(conn, "vendor_info")}
+    except ValueError:
+        return
+    if "is_manual" in columns:
+        return
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "ALTER TABLE vendor_info ADD COLUMN is_manual TINYINT NOT NULL DEFAULT 0"
+        )
+    conn.commit()
+
+
+def list_vendors(database: str | None = None) -> list[dict[str, Any]]:
+    with connection(database) as conn:
+        _ensure_vendor_info_manual_column(conn)
+        ensure_table_exists(conn, "vendor_info")
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                SELECT vendor_name, COALESCE(is_manual, 0) AS is_manual
+                FROM vendor_info
+                WHERE vendor_name IS NOT NULL AND vendor_name != ''
+                ORDER BY vendor_name
+                """
+            )
+            rows = cursor.fetchall()
+    return [normalize_row(row) for row in rows]
+
+
+def add_manual_vendor(vendor_name: str, database: str | None = None) -> dict[str, Any]:
+    name = (vendor_name or "").strip()
+    if not name:
+        raise ValueError("vendor_name is required")
+
+    with connection(database) as conn:
+        _ensure_vendor_info_manual_column(conn)
+        columns = {column.name for column in ensure_table_exists(conn, "vendor_info")}
+        if "vendor_name" not in columns:
+            raise ValueError("vendor_info table must include vendor_name column")
+
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT vendor_name, COALESCE(is_manual, 0) AS is_manual "
+                "FROM vendor_info WHERE vendor_name = %s LIMIT 1",
+                (name,),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute(
+                    "UPDATE vendor_info SET is_manual = 1 WHERE vendor_name = %s",
+                    (name,),
+                )
+            else:
+                insert_cols = ["vendor_name", "is_manual"]
+                insert_vals: list[Any] = [name, 1]
+                if "vendor_code" in columns:
+                    insert_cols.append("vendor_code")
+                    insert_vals.append(name)
+                placeholders = ", ".join(["%s"] * len(insert_cols))
+                col_sql = ", ".join(quote_ident(c) for c in insert_cols)
+                cursor.execute(
+                    f"INSERT INTO vendor_info ({col_sql}) VALUES ({placeholders})",
+                    tuple(insert_vals),
+                )
+        conn.commit()
+
+        row = _get_single_row(
+            conn,
+            "SELECT vendor_name, COALESCE(is_manual, 0) AS is_manual "
+            "FROM vendor_info WHERE vendor_name = %s",
+            (name,),
+        )
+        if not row:
+            raise ValueError("Failed to save manual vendor")
+        return normalize_row(row)
+
+
+def replace_synced_vendors(vendor_names: list[str], database: str | None = None) -> dict[str, int]:
+    """Replace auto-synced vendors while keeping manual entries."""
+    cleaned = []
+    seen: set[str] = set()
+    for raw in vendor_names:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+
+    with connection(database) as conn:
+        _ensure_vendor_info_manual_column(conn)
+        ensure_table_exists(conn, "vendor_info")
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM vendor_info WHERE COALESCE(is_manual, 0) = 0")
+            deleted = cursor.rowcount
+            inserted = 0
+            for name in cleaned:
+                cursor.execute(
+                    """
+                    INSERT INTO vendor_info (vendor_name, is_manual)
+                    VALUES (%s, 0)
+                    ON DUPLICATE KEY UPDATE
+                        is_manual = IF(COALESCE(is_manual, 0) = 1, 1, 0)
+                    """,
+                    (name,),
+                )
+                if cursor.rowcount > 0:
+                    inserted += 1
+        conn.commit()
+        return {"deleted": deleted, "inserted_or_updated": inserted, "received": len(cleaned)}
 
 
 def list_rows(table_name: str, limit: int, offset: int, database: str | None = None, stock_out: bool = False) -> list[dict[str, Any]]:
@@ -229,7 +374,6 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
         ensure_table_exists(conn, table_name)
         if table_name == 'items':
             _ensure_vendor_overrides_table(conn)
-            _ensure_po_column(conn)
             vendor_override_days = _get_vendor_override_days(database)
             join = (
                 "LEFT JOIN vendor_overrides vo "
@@ -237,6 +381,7 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
             )
             select = (
                 "SELECT items.*, "
+                "items.vendor_name AS item_vendor_name, "
                 "COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name, "
                 "vo.set_at AS vendor_override_set_at "
                 f"FROM items {join}"
@@ -350,6 +495,11 @@ def update_row(table_name: str, row_id: Any, payload: dict[str, Any], database: 
 def delete_row(table_name: str, row_id: Any, database: str | None = None) -> bool:
     with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
+        if table_name == "vendor_info":
+            _ensure_vendor_info_manual_column(conn)
+            existing = get_row(table_name, row_id, database)
+            if existing and int(existing.get("is_manual") or 0) == 1:
+                raise ValueError("Manual vendors cannot be deleted")
         pk_column = require_single_primary_key(columns, table_name)
         query = (
             f"DELETE FROM {quote_ident(table_name)} "
@@ -638,6 +788,253 @@ def reset_purchase_suggestions(database: str | None = None) -> int:
             count = cursor.rowcount
         conn.commit()
         return count
+
+
+def _migrate_order_lines_comment_column(conn: MySQLConnection) -> None:
+    columns = {column.name for column in get_columns(conn, "order_lines")}
+    if "order_comments" in columns:
+        return
+    with conn.cursor() as cursor:
+        if "order_comment" in columns:
+            cursor.execute(
+                "ALTER TABLE order_lines CHANGE COLUMN order_comment order_comments VARCHAR(512) NULL"
+            )
+        elif "comment" in columns:
+            cursor.execute(
+                "ALTER TABLE order_lines CHANGE COLUMN comment order_comments VARCHAR(512) NULL"
+            )
+    conn.commit()
+
+
+def _ensure_orders_tables(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                location_id INT NULL,
+                location_order_from_id INT NULL,
+                order_date DATE NULL,
+                order_status VARCHAR(20) NULL,
+                user_id INT NULL,
+                description VARCHAR(255) NULL,
+                created_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                est_delivery_date DATE NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS order_lines (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                order_id INT NULL,
+                item_id INT NOT NULL,
+                order_date DATETIME NULL,
+                est_delivery_date DATE NULL,
+                qty_suggested INT NULL,
+                qty_override INT NULL,
+                order_from_location_id INT NOT NULL DEFAULT 0,
+                order_comments VARCHAR(512) NULL,
+                po VARCHAR(200) NULL,
+                deleted TINYINT NOT NULL DEFAULT 0,
+                status VARCHAR(50) NULL,
+                INDEX idx_order_lines_order_id (order_id),
+                INDEX idx_order_lines_item_id (item_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+    conn.commit()
+    try:
+        _migrate_order_lines_comment_column(conn)
+    except ValueError:
+        pass
+    try:
+        _migrate_po_to_order_lines(conn)
+    except ValueError:
+        pass
+    try:
+        _migrate_order_lines_deleted_column(conn)
+    except ValueError:
+        pass
+    try:
+        _migrate_order_lines_status_column(conn)
+    except ValueError:
+        pass
+
+
+def create_order_from_purchase_suggestions(
+    database: str | None = None,
+    user_id: int | None = None,
+    description: str | None = None,
+) -> dict[str, Any]:
+    with connection(database) as conn:
+        item_columns = {column.name for column in ensure_table_exists(conn, "items")}
+        if "purchase_suggestion" not in item_columns:
+            raise ValueError("items table must include purchase_suggestion to create an order")
+        est_delivery_expr = (
+            "CASE "
+            "WHEN items.del_time IS NULL THEN NULL "
+            "ELSE DATE_ADD(CURDATE(), INTERVAL GREATEST(CAST(items.del_time AS SIGNED), 0) DAY) "
+            "END"
+            if "del_time" in item_columns
+            else "NULL"
+        )
+        _ensure_orders_tables(conn)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO orders (
+                    order_date,
+                    order_status,
+                    user_id,
+                    description,
+                    created_at,
+                    updated_at
+                )
+                VALUES (CURDATE(), 'official_suggestion', %s, %s, NOW(), NOW())
+                """,
+                (user_id, description or "Official innkaupatillaga"),
+            )
+            order_id = cursor.lastrowid
+            cursor.execute(
+                f"""
+                INSERT INTO order_lines (
+                    order_id,
+                    item_id,
+                    order_date,
+                    est_delivery_date,
+                    qty_suggested,
+                    qty_override,
+                    order_from_location_id,
+                    order_comments
+                )
+                SELECT
+                    %s AS order_id,
+                    items.id AS item_id,
+                    NOW() AS order_date,
+                    {est_delivery_expr} AS est_delivery_date,
+                    CAST(ROUND(items.purchase_suggestion) AS SIGNED) AS qty_suggested,
+                    CAST(ROUND(items.purchase_suggestion) AS SIGNED) AS qty_override,
+                    0 AS order_from_location_id,
+                    NULL AS order_comments
+                FROM items
+                WHERE COALESCE(items.purchase_suggestion, 0) > 0
+                """,
+                (order_id,),
+            )
+            line_count = cursor.rowcount
+            if line_count == 0:
+                cursor.execute("DELETE FROM orders WHERE id = %s", (order_id,))
+                order_id = None
+        conn.commit()
+        return {"order_id": order_id, "line_count": line_count}
+
+
+def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    with connection(database) as conn:
+        _ensure_orders_tables(conn)
+        return _get_rows(
+            conn,
+            """
+            SELECT
+                orders.*,
+                COUNT(order_lines.id) AS line_count,
+                COALESCE(SUM(COALESCE(order_lines.qty_override, order_lines.qty_suggested)), 0) AS total_qty
+            FROM orders
+            LEFT JOIN order_lines
+                ON orders.id = order_lines.order_id
+                AND COALESCE(order_lines.deleted, 0) = 0
+            GROUP BY orders.id
+            ORDER BY COALESCE(orders.created_at, orders.order_date) DESC, orders.id DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+
+
+def _order_items_select_sql(vendor_override_days: int) -> str:
+    return f"""
+            SELECT
+                items.*,
+                items.vendor_name AS item_vendor_name,
+                COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name,
+                vo.set_at AS vendor_override_set_at,
+                orders.id AS order_header_id,
+                orders.location_id AS order_location_id,
+                orders.location_order_from_id AS order_location_order_from_id,
+                orders.order_date AS order_header_order_date,
+                orders.order_status AS order_status,
+                orders.user_id AS order_user_id,
+                orders.description AS order_description,
+                orders.created_at AS order_created_at,
+                orders.updated_at AS order_updated_at,
+                orders.est_delivery_date AS order_header_est_delivery_date,
+                order_lines.id AS order_line_id,
+                order_lines.order_id AS order_id,
+                order_lines.item_id AS order_item_id,
+                order_lines.order_date AS order_order_date,
+                order_lines.est_delivery_date AS order_est_delivery_date,
+                order_lines.qty_suggested AS order_qty_suggested,
+                order_lines.qty_override AS order_qty_override,
+                order_lines.order_from_location_id AS order_from_location_id,
+                order_lines.order_comments AS order_comments,
+                order_lines.po AS order_po,
+                order_lines.deleted AS order_deleted,
+                order_lines.status AS order_line_status
+            FROM {{from_clause}}
+            LEFT JOIN vendor_overrides vo
+                ON items.id = vo.item_id
+                AND vo.set_at > DATE_SUB(NOW(), INTERVAL {vendor_override_days} DAY)
+            {{where_clause}}
+            {{order_clause}}
+            LIMIT %s OFFSET %s
+            """
+
+
+def list_order_items(
+    order_id: int,
+    database: str | None = None,
+    limit: int = 20000,
+    offset: int = 0,
+    order_lines_only: bool = True,
+    stock_out: bool = False,
+) -> list[dict[str, Any]]:
+    with connection(database) as conn:
+        ensure_table_exists(conn, "items")
+        _ensure_orders_tables(conn)
+        _ensure_vendor_overrides_table(conn)
+        vendor_override_days = _get_vendor_override_days(database)
+        select_sql = _order_items_select_sql(vendor_override_days)
+        if order_lines_only:
+            query = select_sql.format(
+                from_clause="""
+            order_lines
+            INNER JOIN orders ON orders.id = order_lines.order_id
+            INNER JOIN items ON items.id = order_lines.item_id""",
+                where_clause="WHERE order_lines.order_id = %s AND COALESCE(order_lines.deleted, 0) = 0",
+                order_clause="ORDER BY order_lines.id",
+            )
+            params = (order_id, limit, offset)
+        else:
+            stock_filter = (
+                " AND (items.stock_level <= 0 OR items.stock_level IS NULL)"
+                if stock_out
+                else ""
+            )
+            query = select_sql.format(
+                from_clause="""
+            items
+            LEFT JOIN order_lines
+                ON order_lines.item_id = items.id
+                AND order_lines.order_id = %s
+                AND COALESCE(order_lines.deleted, 0) = 0
+            LEFT JOIN orders ON orders.id = %s""",
+                where_clause=f"WHERE 1=1{stock_filter}",
+                order_clause="ORDER BY items.id",
+            )
+            params = (order_id, order_id, limit, offset)
+        return _get_rows(conn, query, params)
 
 
 def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
