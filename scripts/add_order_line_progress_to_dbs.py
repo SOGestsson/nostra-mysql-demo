@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add order_lines.status and order_line_status to db_ui_config."""
+"""Add order_lines.progress and order_line_progress to db_ui_config."""
 
 from __future__ import annotations
 
@@ -18,20 +18,42 @@ MASTER = dict(
     connection_timeout=15,
 )
 
-ORDER_LINE_STATUS_EDITOR = {
-    "type": "native",
+ORDER_LINE_PROGRESS_EDITOR = {
+    "type": "enum",
     "table": "order_lines",
-    "column": "status",
+    "column": "progress",
+    "options": ["Not Started", "Work in progress", "Finished"],
+}
+
+PROGRESS_STATUS_VALUES = {
+    "not started",
+    "work in progress",
+    "finished",
 }
 
 
-def migrate_status_schema(conn) -> None:
+def migrate_progress_schema(conn) -> None:
     with conn.cursor() as cursor:
-        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'status'")
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'progress'")
         if not cursor.fetchone():
             cursor.execute(
-                "ALTER TABLE order_lines ADD COLUMN status VARCHAR(50) NULL DEFAULT NULL"
+                "ALTER TABLE order_lines ADD COLUMN progress VARCHAR(50) NULL DEFAULT NULL"
             )
+    conn.commit()
+
+
+def migrate_misplaced_progress_from_status(conn) -> None:
+    """Move workflow progress values accidentally stored in status back to progress."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE order_lines
+            SET progress = status,
+                status = NULL
+            WHERE status IS NOT NULL
+              AND LOWER(TRIM(status)) IN ('not started', 'work in progress', 'finished')
+            """
+        )
     conn.commit()
 
 
@@ -41,19 +63,19 @@ def patch_ui_config(config: dict) -> dict:
     editable = list(out.get("editableColumns") or [])
     editors = dict(out.get("columnEditors") or {})
 
-    if "order_line_status" not in visible:
-        if "order_po" in visible:
+    if "order_line_progress" not in visible:
+        if "order_line_status" in visible:
+            idx = visible.index("order_line_status") + 1
+            visible.insert(idx, "order_line_progress")
+        elif "order_po" in visible:
             idx = visible.index("order_po") + 1
-            visible.insert(idx, "order_line_status")
-        elif "order_qty_override" in visible:
-            idx = visible.index("order_qty_override") + 1
-            visible.insert(idx, "order_line_status")
+            visible.insert(idx, "order_line_progress")
         else:
-            visible.append("order_line_status")
-    if "order_line_status" not in editable:
-        editable.append("order_line_status")
-    if "order_line_status" not in editors:
-        editors["order_line_status"] = ORDER_LINE_STATUS_EDITOR
+            visible.append("order_line_progress")
+    if "order_line_progress" not in editable:
+        editable.append("order_line_progress")
+    if editors.get("order_line_progress", {}).get("type") != "enum":
+        editors["order_line_progress"] = ORDER_LINE_PROGRESS_EDITOR
 
     out["visibleColumns"] = visible
     out["editableColumns"] = editable
@@ -96,7 +118,8 @@ def main() -> int:
                     connection_timeout=15,
                 )
                 try:
-                    migrate_status_schema(data_conn)
+                    migrate_progress_schema(data_conn)
+                    migrate_misplaced_progress_from_status(data_conn)
                     print(f"schema ok: {physical} ({logical_name})")
                 finally:
                     data_conn.close()
@@ -119,7 +142,7 @@ def main() -> int:
                     (json.dumps(config, ensure_ascii=False), logical_name),
                 )
             master.commit()
-            print(f"config ok: {logical_name} (order_line_status visible+editable)")
+            print(f"config ok: {logical_name} (order_line_progress visible+editable)")
     finally:
         master.close()
     return 0

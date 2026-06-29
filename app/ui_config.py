@@ -33,6 +33,7 @@ class DbUiConfigPayload(BaseModel):
     editableColumns: list[str] = []
     visibleColumns: list[str] = []
     filterableColumns: list[str] = []
+    hiddenColumns: list[str] = []
     visiblePages: list[str] = []
     columnEditors: dict[str, dict[str, Any]] = Field(default_factory=dict)
     columnLabels: dict[str, str] = Field(default_factory=dict)

@@ -256,6 +256,16 @@ def _migrate_order_lines_status_column(conn: MySQLConnection) -> None:
     conn.commit()
 
 
+def _migrate_order_lines_progress_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'progress'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN progress VARCHAR(50) NULL DEFAULT NULL"
+            )
+    conn.commit()
+
+
 def _ensure_vendor_info_manual_column(conn: MySQLConnection) -> None:
     try:
         columns = {column.name for column in get_columns(conn, "vendor_info")}
@@ -310,6 +320,12 @@ def add_manual_vendor(vendor_name: str, database: str | None = None) -> dict[str
                     "UPDATE vendor_info SET is_manual = 1 WHERE vendor_name = %s",
                     (name,),
                 )
+                if "vendor_code" in columns:
+                    cursor.execute(
+                        "UPDATE vendor_info SET vendor_code = %s "
+                        "WHERE vendor_name = %s AND (vendor_code IS NULL OR TRIM(vendor_code) = '')",
+                        (name, name),
+                    )
             else:
                 insert_cols = ["vendor_name", "is_manual"]
                 insert_vals: list[Any] = [name, 1]
@@ -839,6 +855,7 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
                 po VARCHAR(200) NULL,
                 deleted TINYINT NOT NULL DEFAULT 0,
                 status VARCHAR(50) NULL,
+                progress VARCHAR(50) NULL,
                 INDEX idx_order_lines_order_id (order_id),
                 INDEX idx_order_lines_item_id (item_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -859,6 +876,10 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
         pass
     try:
         _migrate_order_lines_status_column(conn)
+    except ValueError:
+        pass
+    try:
+        _migrate_order_lines_progress_column(conn)
     except ValueError:
         pass
 
@@ -981,7 +1002,8 @@ def _order_items_select_sql(vendor_override_days: int) -> str:
                 order_lines.order_comments AS order_comments,
                 order_lines.po AS order_po,
                 order_lines.deleted AS order_deleted,
-                order_lines.status AS order_line_status
+                order_lines.status AS order_line_status,
+                order_lines.progress AS order_line_progress
             FROM {{from_clause}}
             LEFT JOIN vendor_overrides vo
                 ON items.id = vo.item_id
@@ -1121,6 +1143,9 @@ def get_lookup_options(
     label_column: str | None = None,
     database: str | None = None,
 ) -> list[dict[str, str]]:
+    if table_name == "vendor_info":
+        return _get_vendor_info_lookup_options(value_column, label_column, database)
+
     label_col = label_column or value_column
     with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
@@ -1142,6 +1167,55 @@ def get_lookup_options(
             rows = cursor.fetchall()
     return [
         {"value": str(row["value"]), "label": str(row["label"])}
+        for row in rows
+    ]
+
+
+def _get_vendor_info_lookup_options(
+    value_column: str,
+    label_column: str | None,
+    database: str | None,
+) -> list[dict[str, str]]:
+    label_col = label_column or value_column
+    with connection(database) as conn:
+        _ensure_vendor_info_manual_column(conn)
+        columns = {c.name for c in ensure_table_exists(conn, "vendor_info")}
+        if value_column not in columns:
+            raise ValueError(f"Column not found: {value_column}")
+        if label_col not in columns:
+            raise ValueError(f"Column not found: {label_col}")
+
+        has_vendor_code = "vendor_code" in columns
+        has_vendor_name = "vendor_name" in columns
+        value_expr = quote_ident(value_column)
+        label_expr = quote_ident(label_col)
+        if has_vendor_name and has_vendor_code and value_column == "vendor_code":
+            value_expr = (
+                f"COALESCE(NULLIF(TRIM({quote_ident('vendor_name')}), ''), "
+                f"NULLIF(TRIM({quote_ident('vendor_code')}), ''))"
+            )
+        if has_vendor_name and has_vendor_code and label_col == "vendor_code":
+            label_expr = (
+                f"COALESCE(NULLIF(TRIM({quote_ident('vendor_name')}), ''), "
+                f"NULLIF(TRIM({quote_ident('vendor_code')}), ''))"
+            )
+
+        query = (
+            f"SELECT DISTINCT {value_expr} AS value, {label_expr} AS label, "
+            f"COALESCE(is_manual, 0) AS is_manual "
+            f"FROM {quote_ident('vendor_info')} "
+            f"WHERE {value_expr} IS NOT NULL AND TRIM({value_expr}) != '' "
+            f"ORDER BY COALESCE(is_manual, 0) DESC, {label_expr}"
+        )
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+    return [
+        {
+            "value": str(row["value"]),
+            "label": str(row["label"]),
+            "is_manual": str(int(row.get("is_manual") or 0)),
+        }
         for row in rows
     ]
 
