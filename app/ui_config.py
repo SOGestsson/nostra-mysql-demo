@@ -26,7 +26,13 @@ class LookupEditorConfig(BaseModel):
     save: Literal["direct", "override"] = "direct"
 
 
-ColumnEditorConfig = NativeEditorConfig | EnumEditorConfig | LookupEditorConfig
+class UsersEditorConfig(BaseModel):
+    type: Literal["users"] = "users"
+    table: str = "order_lines"
+    column: str = "assigned_to"
+
+
+ColumnEditorConfig = NativeEditorConfig | EnumEditorConfig | LookupEditorConfig | UsersEditorConfig
 
 
 class DbUiConfigPayload(BaseModel):
@@ -47,6 +53,8 @@ def _parse_editor(raw: dict[str, Any]) -> ColumnEditorConfig:
         return EnumEditorConfig(**raw)
     if editor_type == "lookup":
         return LookupEditorConfig(**raw)
+    if editor_type == "users":
+        return UsersEditorConfig(**raw)
     return NativeEditorConfig(**raw)
 
 
@@ -96,6 +104,15 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
                         f"lookup editor for '{col}': {field_name} '{field_value}' "
                         f"not found in table '{editor.table}'"
                     )
+        elif isinstance(editor, UsersEditorConfig):
+            with db.connection(database) as conn:
+                db.ensure_table_exists(conn, editor.table)
+                user_columns = {c.name for c in db.get_columns(conn, editor.table)}
+            if editor.column not in user_columns:
+                raise ValueError(
+                    f"users editor for '{col}': column '{editor.column}' "
+                    f"not found in table '{editor.table}'"
+                )
         validated_editors[col] = editor.model_dump()
 
     result = payload.model_dump()

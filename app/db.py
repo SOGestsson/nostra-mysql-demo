@@ -216,6 +216,97 @@ def set_vendor_override(item_id: int, vendor_name: str, database: str | None = N
         conn.commit()
 
 
+def _ensure_purchasing_method_overrides_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS purchasing_method_overrides (
+                item_id INT NOT NULL PRIMARY KEY,
+                purchasing_method VARCHAR(64) NOT NULL,
+                set_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+    conn.commit()
+
+
+def _apply_purchasing_method_override(
+    conn: MySQLConnection,
+    item_id: int,
+    purchasing_method: Any,
+) -> None:
+    _ensure_purchasing_method_overrides_table(conn)
+    name = str(purchasing_method or "").strip()
+    with conn.cursor() as cursor:
+        if not name:
+            cursor.execute(
+                "DELETE FROM purchasing_method_overrides WHERE item_id = %s",
+                (item_id,),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO purchasing_method_overrides (item_id, purchasing_method, set_at)
+                VALUES (%s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    purchasing_method = VALUES(purchasing_method),
+                    set_at = NOW()
+                """,
+                (item_id, name),
+            )
+
+
+def set_purchasing_method_override(
+    item_id: int,
+    purchasing_method: str,
+    database: str | None = None,
+) -> None:
+    with connection(database) as conn:
+        _apply_purchasing_method_override(conn, item_id, purchasing_method)
+        conn.commit()
+
+
+def _item_override_join_sql(vendor_override_days: int) -> str:
+    return (
+        "LEFT JOIN vendor_overrides vo "
+        f"ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL {vendor_override_days} DAY) "
+        "LEFT JOIN purchasing_method_overrides pmo "
+        "ON items.id = pmo.item_id"
+    )
+
+
+def _item_override_select_fields() -> str:
+    return (
+        "items.*, "
+        "items.vendor_name AS item_vendor_name, "
+        "COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name, "
+        "vo.set_at AS vendor_override_set_at, "
+        "items.purchasing_method AS item_purchasing_method, "
+        "COALESCE(pmo.purchasing_method, items.purchasing_method) AS purchasing_method, "
+        "pmo.set_at AS purchasing_method_override_set_at"
+    )
+
+
+def get_item_with_overrides(item_id: int, database: str | None = None) -> dict[str, Any] | None:
+    with connection(database) as conn:
+        row = _fetch_item_with_overrides_conn(conn, item_id, database)
+        return normalize_row(row) if row else None
+
+
+def _fetch_item_with_overrides_conn(
+    conn: MySQLConnection,
+    item_id: int,
+    database: str | None = None,
+) -> dict[str, Any] | None:
+    _ensure_vendor_overrides_table(conn)
+    _ensure_purchasing_method_overrides_table(conn)
+    vendor_override_days = _get_vendor_override_days(database)
+    query = (
+        f"SELECT {_item_override_select_fields()} "
+        f"FROM items {_item_override_join_sql(vendor_override_days)} "
+        "WHERE items.id = %s"
+    )
+    return _get_single_row(conn, query, (item_id,))
+
+
 def _migrate_po_to_order_lines(conn: MySQLConnection) -> None:
     with conn.cursor() as cursor:
         cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'po'")
@@ -262,6 +353,16 @@ def _migrate_order_lines_progress_column(conn: MySQLConnection) -> None:
         if not cursor.fetchone():
             cursor.execute(
                 "ALTER TABLE order_lines ADD COLUMN progress VARCHAR(50) NULL DEFAULT NULL"
+            )
+    conn.commit()
+
+
+def _migrate_order_lines_assigned_to_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'assigned_to'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN assigned_to INT NULL DEFAULT NULL"
             )
     conn.commit()
 
@@ -390,18 +491,10 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
         ensure_table_exists(conn, table_name)
         if table_name == 'items':
             _ensure_vendor_overrides_table(conn)
+            _ensure_purchasing_method_overrides_table(conn)
             vendor_override_days = _get_vendor_override_days(database)
-            join = (
-                "LEFT JOIN vendor_overrides vo "
-                f"ON items.id = vo.item_id AND vo.set_at > DATE_SUB(NOW(), INTERVAL {vendor_override_days} DAY)"
-            )
-            select = (
-                "SELECT items.*, "
-                "items.vendor_name AS item_vendor_name, "
-                "COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name, "
-                "vo.set_at AS vendor_override_set_at "
-                f"FROM items {join}"
-            )
+            join = _item_override_join_sql(vendor_override_days)
+            select = f"SELECT {_item_override_select_fields()} FROM items {join}"
             if stock_out:
                 query = f"{select} WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
                 params: tuple = ()
@@ -422,6 +515,8 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
 
 
 def get_row(table_name: str, row_id: Any, database: str | None = None) -> dict[str, Any] | None:
+    if table_name == "items":
+        return get_item_with_overrides(row_id, database)
     with connection(database) as conn:
         columns = ensure_table_exists(conn, table_name)
         pk_column = require_single_primary_key(columns, table_name)
@@ -494,6 +589,13 @@ def update_row(table_name: str, row_id: Any, payload: dict[str, Any], database: 
         if not data:
             raise ValueError("Payload does not contain valid updatable columns")
 
+        if table_name == "items" and "purchasing_method" in data:
+            _apply_purchasing_method_override(conn, row_id, data.pop("purchasing_method"))
+
+        if not data:
+            conn.commit()
+            return get_item_with_overrides(row_id, database)
+
         assignments = ", ".join(f"{quote_ident(name)} = %s" for name in data)
         query = (
             f"UPDATE {quote_ident(table_name)} "
@@ -544,11 +646,7 @@ def get_sim_input_data(
         raise ValueError("service_level must be greater than 0 and at most 1")
 
     with connection(database) as conn:
-        item = _get_single_row(
-            conn,
-            "SELECT * FROM `items` WHERE `id` = %s",
-            (item_id,),
-        )
+        item = _fetch_item_with_overrides_conn(conn, item_id, database)
         if not item:
             raise ValueError(f"Item not found: {item_id}")
 
@@ -797,10 +895,58 @@ def update_purchase_suggestions(suggestions: list[dict[str, Any]], database: str
         return sum(1 for s in suggestions if s.get("purchase_qty", 0) is not None)
 
 
-def reset_purchase_suggestions(database: str | None = None) -> int:
-    with connection(database) as conn:
+_POSITIVE_ORDER_QTY_SQL = (
+    "COALESCE(order_lines.qty_override, order_lines.qty_suggested, 0) > 0"
+)
+
+
+def _resolve_item_ids_for_order_scope(
+    conn: MySQLConnection,
+    *,
+    item_ids: list[int] | None = None,
+    source_order_id: int | None = None,
+) -> list[int] | None:
+    if source_order_id is not None:
+        _ensure_orders_tables(conn)
         with conn.cursor() as cursor:
-            cursor.execute("UPDATE items SET purchase_suggestion = 0")
+            cursor.execute(
+                """
+                SELECT DISTINCT order_lines.item_id
+                FROM order_lines
+                WHERE order_lines.order_id = %s
+                  AND COALESCE(order_lines.deleted, 0) = 0
+                ORDER BY order_lines.item_id
+                """,
+                (source_order_id,),
+            )
+            return [int(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
+    if item_ids:
+        return sorted({int(item_id) for item_id in item_ids})
+    return None
+
+
+def reset_purchase_suggestions(
+    database: str | None = None,
+    item_ids: list[int] | None = None,
+    source_order_id: int | None = None,
+) -> int:
+    with connection(database) as conn:
+        scoped_ids = _resolve_item_ids_for_order_scope(
+            conn,
+            item_ids=item_ids,
+            source_order_id=source_order_id,
+        )
+        with conn.cursor() as cursor:
+            if scoped_ids is None:
+                cursor.execute("UPDATE items SET purchase_suggestion = 0")
+            elif not scoped_ids:
+                return 0
+            else:
+                placeholders = ",".join(["%s"] * len(scoped_ids))
+                cursor.execute(
+                    f"UPDATE items SET purchase_suggestion = 0 WHERE id IN ({placeholders})",
+                    scoped_ids,
+                )
             count = cursor.rowcount
         conn.commit()
         return count
@@ -856,6 +1002,7 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
                 deleted TINYINT NOT NULL DEFAULT 0,
                 status VARCHAR(50) NULL,
                 progress VARCHAR(50) NULL,
+                assigned_to INT NULL,
                 INDEX idx_order_lines_order_id (order_id),
                 INDEX idx_order_lines_item_id (item_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -882,12 +1029,18 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
         _migrate_order_lines_progress_column(conn)
     except ValueError:
         pass
+    try:
+        _migrate_order_lines_assigned_to_column(conn)
+    except ValueError:
+        pass
 
 
 def create_order_from_purchase_suggestions(
     database: str | None = None,
     user_id: int | None = None,
     description: str | None = None,
+    item_ids: list[int] | None = None,
+    source_order_id: int | None = None,
 ) -> dict[str, Any]:
     with connection(database) as conn:
         item_columns = {column.name for column in ensure_table_exists(conn, "items")}
@@ -902,6 +1055,19 @@ def create_order_from_purchase_suggestions(
             else "NULL"
         )
         _ensure_orders_tables(conn)
+        scoped_ids = _resolve_item_ids_for_order_scope(
+            conn,
+            item_ids=item_ids,
+            source_order_id=source_order_id,
+        )
+        scope_sql = ""
+        scope_params: tuple[Any, ...] = ()
+        if scoped_ids is not None:
+            if not scoped_ids:
+                return {"order_id": None, "line_count": 0}
+            placeholders = ",".join(["%s"] * len(scoped_ids))
+            scope_sql = f" AND items.id IN ({placeholders})"
+            scope_params = tuple(scoped_ids)
         with conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -941,8 +1107,9 @@ def create_order_from_purchase_suggestions(
                     NULL AS order_comments
                 FROM items
                 WHERE COALESCE(items.purchase_suggestion, 0) > 0
+                {scope_sql}
                 """,
-                (order_id,),
+                (order_id, *scope_params),
             )
             line_count = cursor.rowcount
             if line_count == 0:
@@ -957,7 +1124,7 @@ def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str,
         _ensure_orders_tables(conn)
         return _get_rows(
             conn,
-            """
+            f"""
             SELECT
                 orders.*,
                 COUNT(order_lines.id) AS line_count,
@@ -966,6 +1133,7 @@ def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str,
             LEFT JOIN order_lines
                 ON orders.id = order_lines.order_id
                 AND COALESCE(order_lines.deleted, 0) = 0
+                AND {_POSITIVE_ORDER_QTY_SQL}
             GROUP BY orders.id
             ORDER BY COALESCE(orders.created_at, orders.order_date) DESC, orders.id DESC
             LIMIT %s
@@ -977,10 +1145,7 @@ def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str,
 def _order_items_select_sql(vendor_override_days: int) -> str:
     return f"""
             SELECT
-                items.*,
-                items.vendor_name AS item_vendor_name,
-                COALESCE(vo.vendor_name, items.vendor_name) AS vendor_name,
-                vo.set_at AS vendor_override_set_at,
+                {_item_override_select_fields()},
                 orders.id AS order_header_id,
                 orders.location_id AS order_location_id,
                 orders.location_order_from_id AS order_location_order_from_id,
@@ -1003,11 +1168,10 @@ def _order_items_select_sql(vendor_override_days: int) -> str:
                 order_lines.po AS order_po,
                 order_lines.deleted AS order_deleted,
                 order_lines.status AS order_line_status,
-                order_lines.progress AS order_line_progress
+                order_lines.progress AS order_line_progress,
+                order_lines.assigned_to AS order_assigned_to
             FROM {{from_clause}}
-            LEFT JOIN vendor_overrides vo
-                ON items.id = vo.item_id
-                AND vo.set_at > DATE_SUB(NOW(), INTERVAL {vendor_override_days} DAY)
+            {_item_override_join_sql(vendor_override_days)}
             {{where_clause}}
             {{order_clause}}
             LIMIT %s OFFSET %s
@@ -1026,6 +1190,7 @@ def list_order_items(
         ensure_table_exists(conn, "items")
         _ensure_orders_tables(conn)
         _ensure_vendor_overrides_table(conn)
+        _ensure_purchasing_method_overrides_table(conn)
         vendor_override_days = _get_vendor_override_days(database)
         select_sql = _order_items_select_sql(vendor_override_days)
         if order_lines_only:
@@ -1034,7 +1199,11 @@ def list_order_items(
             order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
             INNER JOIN items ON items.id = order_lines.item_id""",
-                where_clause="WHERE order_lines.order_id = %s AND COALESCE(order_lines.deleted, 0) = 0",
+                where_clause=(
+                    "WHERE order_lines.order_id = %s"
+                    " AND COALESCE(order_lines.deleted, 0) = 0"
+                    f" AND {_POSITIVE_ORDER_QTY_SQL}"
+                ),
                 order_clause="ORDER BY order_lines.id",
             )
             params = (order_id, limit, offset)

@@ -171,6 +171,38 @@ def list_users() -> list[dict]:
     ]
 
 
+def list_users_for_database(database_name: str) -> list[dict]:
+    db_name = (database_name or "").strip()
+    if not db_name:
+        raise ValueError("database_name is required")
+    conn = _master_conn()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                """
+                SELECT id, username, email
+                FROM users
+                WHERE database_name = %s
+                ORDER BY username, id
+                """,
+                (db_name,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+def require_db_users_access(token: str, database_name: str) -> dict:
+    payload = verify_token(token)
+    db_name = (database_name or "").strip()
+    if not db_name:
+        raise ValueError("db is required")
+    if not payload.get("is_admin") and payload.get("database_name") != db_name:
+        raise ValueError("Access denied for this database")
+    return payload
+
+
 def delete_user(user_id: int) -> bool:
     conn = _master_conn()
     try:

@@ -54,8 +54,19 @@ class VendorOverridePayload(BaseModel):
     vendor_name: str
 
 
+class PurchasingMethodOverridePayload(BaseModel):
+    purchasing_method: str
+
+
 class CreateOrderFromSuggestionsPayload(BaseModel):
     description: str | None = None
+    source_order_id: int | None = None
+    item_ids: list[int] | None = None
+
+
+class ResetPurchaseSuggestionsPayload(BaseModel):
+    item_ids: list[int] | None = None
+    source_order_id: int | None = None
 
 
 class UserDbConfigPayload(BaseModel):
@@ -65,6 +76,8 @@ class UserDbConfigPayload(BaseModel):
     ordersFilterableColumns: list[str] | None = None
     columnWidths: dict[str, int] | None = None
     ordersColumnWidths: dict[str, int] | None = None
+    catalogFrozenColumnCount: int | None = None
+    ordersFrozenColumnCount: int | None = None
     catalogGridPaging: str | None = None
     ordersGridPaging: str | None = None
 
@@ -116,6 +129,21 @@ def admin_list_users(authorization: str = Header(default="")) -> dict:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+@app.get("/db-users")
+def list_db_users(
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_db_users_access(token, db_name)
+        return {"users": auth_module.list_users_for_database(db_name)}
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 401 if message in {"Token expired", "Invalid token"} else 403
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+
 @app.post("/admin/users", status_code=status.HTTP_201_CREATED)
 def admin_create_user(payload: RegisterRequest, authorization: str = Header(default="")) -> dict:
     token = authorization.removeprefix("Bearer ").strip()
@@ -160,6 +188,8 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
             **({"ordersFilterableColumns": user_config["ordersFilterableColumns"]} if "ordersFilterableColumns" in user_config else {}),
             **({"columnWidths": user_config["columnWidths"]} if "columnWidths" in user_config else {}),
             **({"ordersColumnWidths": user_config["ordersColumnWidths"]} if "ordersColumnWidths" in user_config else {}),
+            **({"catalogFrozenColumnCount": user_config["catalogFrozenColumnCount"]} if "catalogFrozenColumnCount" in user_config else {}),
+            **({"ordersFrozenColumnCount": user_config["ordersFrozenColumnCount"]} if "ordersFrozenColumnCount" in user_config else {}),
             **({"catalogGridPaging": user_config["catalogGridPaging"]} if "catalogGridPaging" in user_config else {}),
             **({"ordersGridPaging": user_config["ordersGridPaging"]} if "ordersGridPaging" in user_config else {}),
         }
@@ -239,6 +269,32 @@ def set_vendor_override(
         auth_module.verify_token(token)
         db.set_vendor_override(item_id, payload.vendor_name, db_name)
         return {"item_id": item_id, "vendor_name": payload.vendor_name}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.put("/items/{item_id}/purchasing-method-override")
+def set_purchasing_method_override(
+    item_id: int,
+    payload: PurchasingMethodOverridePayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        db.set_purchasing_method_override(item_id, payload.purchasing_method, db_name)
+        item = db.get_item_with_overrides(item_id, db_name)
+        if not item:
+            raise HTTPException(status_code=404, detail="Item not found")
+        return {
+            "item_id": item_id,
+            "purchasing_method": item.get("purchasing_method"),
+            "item_purchasing_method": item.get("item_purchasing_method"),
+            "purchasing_method_override_set_at": item.get("purchasing_method_override_set_at"),
+        }
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
@@ -447,13 +503,18 @@ def save_purchase_suggestions(
 
 @app.post("/purchase-suggestions/reset", status_code=status.HTTP_200_OK)
 def reset_purchase_suggestions(
+    payload: ResetPurchaseSuggestionsPayload | None = None,
     db_name: str = Query(..., alias="db"),
     authorization: str = Header(default=""),
 ) -> dict[str, Any]:
     token = authorization.removeprefix("Bearer ").strip()
     try:
         auth_module.verify_token(token)
-        count = db.reset_purchase_suggestions(database=db_name)
+        count = db.reset_purchase_suggestions(
+            database=db_name,
+            item_ids=payload.item_ids if payload else None,
+            source_order_id=payload.source_order_id if payload else None,
+        )
         return {"updated": count}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
@@ -474,6 +535,8 @@ def create_order_from_purchase_suggestions(
             database=db_name,
             user_id=user.get("id"),
             description=payload.description if payload else None,
+            item_ids=payload.item_ids if payload else None,
+            source_order_id=payload.source_order_id if payload else None,
         )
         return {"order": result}
     except ValueError as exc:
