@@ -64,6 +64,14 @@ class CreateOrderFromSuggestionsPayload(BaseModel):
     item_ids: list[int] | None = None
 
 
+class AddOrderLinePayload(BaseModel):
+    item_number: str
+    qty: int
+    description: str | None = None
+    vendor_name: str | None = None
+    unit_price: float | None = None
+
+
 class ResetPurchaseSuggestionsPayload(BaseModel):
     item_ids: list[int] | None = None
     source_order_id: int | None = None
@@ -586,6 +594,54 @@ def list_order_items(
         return {"order_id": order_id, "count": len(rows), "rows": rows}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/items/by-number")
+def get_item_by_number(
+    item_number: str = Query(..., min_length=1),
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        item = db.get_item_by_item_number(item_number=item_number, database=db_name)
+        if not item:
+            return {"found": False, "item": None}
+        return {"found": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/orders/{order_id}/lines", status_code=status.HTTP_201_CREATED)
+def add_order_line(
+    order_id: int,
+    payload: AddOrderLinePayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        result = db.add_order_line(
+            order_id=order_id,
+            item_number=payload.item_number,
+            qty=payload.qty,
+            description=payload.description,
+            vendor_name=payload.vendor_name,
+            unit_price=payload.unit_price,
+            database=db_name,
+        )
+        return result
+    except ValueError as exc:
+        detail = str(exc)
+        if detail.startswith("Order "):
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 

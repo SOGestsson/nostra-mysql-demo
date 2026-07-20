@@ -3,7 +3,11 @@ set -e
 
 IMAGE="sogestsson/nostra-mysql-demo-api:latest"
 SSH_USER="siggi"
-SSH_HOST="${DEPLOY_HOST:-192.168.1.50}"
+# Tailscale (utan heimilisnets):
+#   raspberrypi    100.108.73.62   db-api :8001, demo frontend :8080
+#   fagrihvammur   100.117.16.77   consumables frontend :8080, drilling :8081
+# LAN heima: DEPLOY_HOST=192.168.1.50 bash deploy-db-api.sh
+SSH_HOST="${DEPLOY_HOST:-100.108.73.62}"
 SSH_PASS="Superman"
 CONTAINER="db-api"
 PORT="8001"

@@ -367,6 +367,40 @@ def _migrate_order_lines_assigned_to_column(conn: MySQLConnection) -> None:
     conn.commit()
 
 
+def _migrate_order_lines_manual_columns(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'is_manual'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN is_manual TINYINT NOT NULL DEFAULT 0"
+            )
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'manual_item_number'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN manual_item_number VARCHAR(100) NULL DEFAULT NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'manual_description'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN manual_description VARCHAR(255) NULL DEFAULT NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'manual_vendor_name'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN manual_vendor_name VARCHAR(255) NULL DEFAULT NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'manual_unit_price'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN manual_unit_price DECIMAL(12,2) NULL DEFAULT NULL"
+            )
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'item_id'")
+        item_id_col = cursor.fetchone()
+        if item_id_col and str(item_id_col[2]).upper() == "NO":
+            cursor.execute("ALTER TABLE order_lines MODIFY item_id INT NULL")
+    conn.commit()
+
+
 def _ensure_vendor_info_manual_column(conn: MySQLConnection) -> None:
     try:
         columns = {column.name for column in get_columns(conn, "vendor_info")}
@@ -914,6 +948,7 @@ def _resolve_item_ids_for_order_scope(
                 SELECT DISTINCT order_lines.item_id
                 FROM order_lines
                 WHERE order_lines.order_id = %s
+                  AND order_lines.item_id IS NOT NULL
                   AND COALESCE(order_lines.deleted, 0) = 0
                 ORDER BY order_lines.item_id
                 """,
@@ -1033,6 +1068,10 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
         _migrate_order_lines_assigned_to_column(conn)
     except ValueError:
         pass
+    try:
+        _migrate_order_lines_manual_columns(conn)
+    except ValueError:
+        pass
 
 
 def create_order_from_purchase_suggestions(
@@ -1142,10 +1181,113 @@ def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str,
         )
 
 
-def _order_items_select_sql(vendor_override_days: int) -> str:
+def _sql_item_col(item_cols: set[str], name: str, alias: str | None = None) -> str:
+    out = alias or name
+    if name in item_cols:
+        return f"items.{name} AS {out}"
+    return f"NULL AS {out}"
+
+
+def _order_line_display_item_fields(conn: MySQLConnection) -> str:
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    ol_cols = {column.name for column in get_columns(conn, "order_lines")}
+    has_manual = "is_manual" in ol_cols
+
+    if "location_name" in item_cols:
+        location_name_sql = "items.location_name AS location_name"
+    elif "location" in item_cols:
+        location_name_sql = "items.location AS location_name"
+    else:
+        location_name_sql = "NULL AS location_name"
+
+    unit_parts: list[str] = []
+    if "unit_cost" in item_cols:
+        unit_parts.append("items.unit_cost")
+    if "price" in item_cols:
+        unit_parts.append("items.price")
+    if "manual_unit_price" in ol_cols:
+        unit_parts.append("order_lines.manual_unit_price")
+    if len(unit_parts) >= 2:
+        unit_sql = f"COALESCE({', '.join(unit_parts)})"
+    elif unit_parts:
+        unit_sql = unit_parts[0]
+    else:
+        unit_sql = "NULL"
+
+    vendor_parts = ["vo.vendor_name", "items.vendor_name"]
+    if "manual_vendor_name" in ol_cols:
+        vendor_parts.append("order_lines.manual_vendor_name")
+    vendor_sql = f"COALESCE({', '.join(vendor_parts)}) AS vendor_name"
+
+    id_sql = (
+        "COALESCE(items.id, -order_lines.id) AS id"
+        if has_manual
+        else "items.id AS id"
+    )
+    if has_manual and "manual_item_number" in ol_cols:
+        item_number_sql = (
+            "COALESCE(items.item_number, order_lines.manual_item_number) AS item_number"
+        )
+    else:
+        item_number_sql = "items.item_number AS item_number"
+    if has_manual and "manual_description" in ol_cols:
+        description_sql = (
+            "COALESCE(items.description, order_lines.manual_description) AS description"
+        )
+    else:
+        description_sql = "items.description AS description"
+
+    if has_manual:
+        manual_sql = (
+            "order_lines.is_manual AS order_is_manual, "
+            "order_lines.manual_item_number AS order_manual_item_number, "
+            "order_lines.manual_description AS order_manual_description, "
+            "order_lines.manual_vendor_name AS order_manual_vendor_name, "
+            "order_lines.manual_unit_price AS order_manual_unit_price"
+        )
+    else:
+        manual_sql = (
+            "0 AS order_is_manual, "
+            "NULL AS order_manual_item_number, "
+            "NULL AS order_manual_description, "
+            "NULL AS order_manual_vendor_name, "
+            "NULL AS order_manual_unit_price"
+        )
+
+    parts = [
+        id_sql,
+        item_number_sql,
+        description_sql,
+        _sql_item_col(item_cols, "stock_level"),
+        _sql_item_col(item_cols, "qty_on_order"),
+        _sql_item_col(item_cols, "purchase_suggestion"),
+        _sql_item_col(item_cols, "buy_freq"),
+        _sql_item_col(item_cols, "del_time"),
+        location_name_sql,
+        _sql_item_col(item_cols, "location"),
+        _sql_item_col(item_cols, "last_year_usage"),
+        _sql_item_col(item_cols, "num_move_last_year"),
+        _sql_item_col(item_cols, "comment"),
+        _sql_item_col(item_cols, "active_flag"),
+        _sql_item_col(item_cols, "purch_sugg_creation_date"),
+        "items.vendor_name AS item_vendor_name",
+        vendor_sql,
+        "vo.set_at AS vendor_override_set_at",
+        "items.purchasing_method AS item_purchasing_method",
+        "COALESCE(pmo.purchasing_method, items.purchasing_method) AS purchasing_method",
+        "pmo.set_at AS purchasing_method_override_set_at",
+        f"{unit_sql} AS unit_cost",
+        f"{unit_sql} AS unit_price",
+        f"{unit_sql} AS price",
+        manual_sql,
+    ]
+    return ",\n                ".join(parts)
+
+
+def _order_items_select_sql(vendor_override_days: int, item_fields: str) -> str:
     return f"""
             SELECT
-                {_item_override_select_fields()},
+                {item_fields},
                 orders.id AS order_header_id,
                 orders.location_id AS order_location_id,
                 orders.location_order_from_id AS order_location_order_from_id,
@@ -1192,13 +1334,14 @@ def list_order_items(
         _ensure_vendor_overrides_table(conn)
         _ensure_purchasing_method_overrides_table(conn)
         vendor_override_days = _get_vendor_override_days(database)
-        select_sql = _order_items_select_sql(vendor_override_days)
+        item_fields = _order_line_display_item_fields(conn)
+        select_sql = _order_items_select_sql(vendor_override_days, item_fields)
         if order_lines_only:
             query = select_sql.format(
                 from_clause="""
             order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
-            INNER JOIN items ON items.id = order_lines.item_id""",
+            LEFT JOIN items ON items.id = order_lines.item_id""",
                 where_clause=(
                     "WHERE order_lines.order_id = %s"
                     " AND COALESCE(order_lines.deleted, 0) = 0"
@@ -1226,6 +1369,190 @@ def list_order_items(
             )
             params = (order_id, order_id, limit, offset)
         return _get_rows(conn, query, params)
+
+
+def _normalize_item_number(item_number: str | None) -> str:
+    return (item_number or "").strip()
+
+
+def _item_number_where_sql(column: str = "items.item_number") -> str:
+    return f"TRIM({column}) = %s"
+
+
+def get_item_by_item_number(item_number: str, database: str | None = None) -> dict[str, Any] | None:
+    pn = _normalize_item_number(item_number)
+    if not pn:
+        return None
+    with connection(database) as conn:
+        ensure_table_exists(conn, "items")
+        _ensure_vendor_overrides_table(conn)
+        _ensure_purchasing_method_overrides_table(conn)
+        vendor_override_days = _get_vendor_override_days(database)
+        row = _get_single_row(
+            conn,
+            (
+                f"SELECT {_item_override_select_fields()} "
+                f"FROM items {_item_override_join_sql(vendor_override_days)} "
+                f"WHERE {_item_number_where_sql()} LIMIT 1"
+            ),
+            (pn,),
+        )
+        return normalize_row(row) if row else None
+
+
+def _fetch_order_item_row(
+    conn: MySQLConnection,
+    order_id: int,
+    order_line_id: int,
+    database: str | None,
+) -> dict[str, Any] | None:
+    ensure_table_exists(conn, "items")
+    _ensure_orders_tables(conn)
+    _ensure_vendor_overrides_table(conn)
+    _ensure_purchasing_method_overrides_table(conn)
+    vendor_override_days = _get_vendor_override_days(database)
+    item_fields = _order_line_display_item_fields(conn)
+    query = f"""
+            SELECT
+                {item_fields},
+                orders.id AS order_header_id,
+                orders.location_id AS order_location_id,
+                orders.location_order_from_id AS order_location_order_from_id,
+                orders.order_date AS order_header_order_date,
+                orders.order_status AS order_status,
+                orders.user_id AS order_user_id,
+                orders.description AS order_description,
+                orders.created_at AS order_created_at,
+                orders.updated_at AS order_updated_at,
+                orders.est_delivery_date AS order_header_est_delivery_date,
+                order_lines.id AS order_line_id,
+                order_lines.order_id AS order_id,
+                order_lines.item_id AS order_item_id,
+                order_lines.order_date AS order_order_date,
+                order_lines.est_delivery_date AS order_est_delivery_date,
+                order_lines.qty_suggested AS order_qty_suggested,
+                order_lines.qty_override AS order_qty_override,
+                order_lines.order_from_location_id AS order_from_location_id,
+                order_lines.order_comments AS order_comments,
+                order_lines.po AS order_po,
+                order_lines.deleted AS order_deleted,
+                order_lines.status AS order_line_status,
+                order_lines.progress AS order_line_progress,
+                order_lines.assigned_to AS order_assigned_to
+            FROM order_lines
+            INNER JOIN orders ON orders.id = order_lines.order_id
+            LEFT JOIN items ON items.id = order_lines.item_id
+            {_item_override_join_sql(vendor_override_days)}
+            WHERE order_lines.order_id = %s
+              AND order_lines.id = %s
+              AND COALESCE(order_lines.deleted, 0) = 0
+            LIMIT 1
+            """
+    row = _get_single_row(conn, query, (order_id, order_line_id))
+    return normalize_row(row) if row else None
+
+
+def add_order_line(
+    order_id: int,
+    *,
+    item_number: str,
+    qty: int,
+    description: str | None = None,
+    vendor_name: str | None = None,
+    unit_price: float | None = None,
+    database: str | None = None,
+) -> dict[str, Any]:
+    pn = _normalize_item_number(item_number)
+    if not pn:
+        raise ValueError("item_number is required")
+    try:
+        qty_int = int(qty)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("qty must be a positive integer") from exc
+    if qty_int <= 0:
+        raise ValueError("qty must be a positive integer")
+
+    with connection(database) as conn:
+        _ensure_orders_tables(conn)
+        ensure_table_exists(conn, "items")
+        order = _get_single_row(conn, "SELECT id FROM orders WHERE id = %s", (order_id,))
+        if not order:
+            raise ValueError(f"Order {order_id} not found")
+
+        item = _get_single_row(
+            conn,
+            f"SELECT id, del_time FROM items WHERE {_item_number_where_sql()} LIMIT 1",
+            (pn,),
+        )
+        item_columns = {column.name for column in ensure_table_exists(conn, "items")}
+        est_delivery_expr = (
+            "CASE "
+            "WHEN items.del_time IS NULL THEN NULL "
+            "ELSE DATE_ADD(CURDATE(), INTERVAL GREATEST(CAST(items.del_time AS SIGNED), 0) DAY) "
+            "END"
+            if "del_time" in item_columns
+            else "NULL"
+        )
+
+        with conn.cursor() as cursor:
+            if item:
+                cursor.execute(
+                    f"""
+                    INSERT INTO order_lines (
+                        order_id,
+                        item_id,
+                        is_manual,
+                        order_date,
+                        est_delivery_date,
+                        qty_suggested,
+                        qty_override,
+                        order_from_location_id
+                    )
+                    SELECT
+                        %s AS order_id,
+                        items.id AS item_id,
+                        0 AS is_manual,
+                        NOW() AS order_date,
+                        {est_delivery_expr} AS est_delivery_date,
+                        %s AS qty_suggested,
+                        %s AS qty_override,
+                        0 AS order_from_location_id
+                    FROM items
+                    WHERE items.id = %s
+                    """,
+                    (order_id, qty_int, qty_int, item["id"]),
+                )
+            else:
+                desc = (description or "").strip()
+                if not desc:
+                    raise ValueError("description is required when item_number is not in catalog")
+                vendor = (vendor_name or "").strip() or None
+                price = float(unit_price) if unit_price is not None and unit_price != "" else None
+                cursor.execute(
+                    """
+                    INSERT INTO order_lines (
+                        order_id,
+                        item_id,
+                        is_manual,
+                        manual_item_number,
+                        manual_description,
+                        manual_vendor_name,
+                        manual_unit_price,
+                        order_date,
+                        qty_suggested,
+                        qty_override,
+                        order_from_location_id
+                    )
+                    VALUES (%s, NULL, 1, %s, %s, %s, %s, NOW(), %s, %s, 0)
+                    """,
+                    (order_id, pn, desc, vendor, price, qty_int, qty_int),
+                )
+            line_id = cursor.lastrowid
+        conn.commit()
+        row = _fetch_order_item_row(conn, order_id, line_id, database)
+        if not row:
+            raise ValueError("Failed to load created order line")
+        return {"order_line_id": line_id, "row": row}
 
 
 def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
