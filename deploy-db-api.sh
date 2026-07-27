@@ -35,9 +35,21 @@ REMOTE_CMD="
     -e MASTER_DB_PASSWORD=Superman \
     -e JWT_SECRET=nostradamus-secret-key \
     $IMAGE &&
-  sleep 2 &&
-  curl -sf 'http://127.0.0.1:$PORT/tables/items/rows?db=consumables&limit=1' >/dev/null &&
-  echo 'db-api ok' &&
+  HEALTH_URL='http://127.0.0.1:$PORT/tables/items/rows?db=consumables&limit=1' &&
+  ok=0 &&
+  for i in \$(seq 1 30); do
+    if curl -sf \"\$HEALTH_URL\" >/dev/null; then
+      echo \"db-api ok (attempt \$i)\"
+      ok=1
+      break
+    fi
+    sleep 2
+  done &&
+  if [ \"\$ok\" -ne 1 ]; then
+    echo 'db-api health check failed after 30 attempts' >&2
+    docker logs --tail 50 $CONTAINER >&2 || true
+    exit 1
+  fi &&
   docker ps --filter name=$CONTAINER
 "
 
