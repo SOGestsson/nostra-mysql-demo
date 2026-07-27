@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
@@ -10,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app import db, auth as auth_module, ui_config as ui_config_module
+
+logger = logging.getLogger(__name__)
 
 
 class PurchaseSuggestion(BaseModel):
@@ -671,12 +674,16 @@ def sim_prep(
             return item_id, exc
 
     results: dict[int, dict] = {}
+    skipped: list[int] = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_one, item_id): item_id for item_id in item_ids}
         for future in as_completed(futures):
             item_id, result = future.result()
             if isinstance(result, ValueError):
                 message = str(result)
+                if message.startswith("Item not found"):
+                    skipped.append(item_id)
+                    continue
                 status_code = 404 if message.startswith("Item not found") else 400
                 raise HTTPException(status_code=status_code, detail=message)
             if isinstance(result, mysql.connector.Error):
@@ -684,6 +691,9 @@ def sim_prep(
             if isinstance(result, Exception):
                 raise HTTPException(status_code=500, detail=str(result))
             results[item_id] = result
+
+    if skipped:
+        logger.warning("sim-prep skipped missing items: %s", skipped)
 
     return [results[item_id] for item_id in item_ids if item_id in results]
 

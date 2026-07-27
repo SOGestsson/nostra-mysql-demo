@@ -1181,11 +1181,39 @@ def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str,
         )
 
 
+def _sql_quote_identifier(name: str) -> str:
+    return f"`{name.replace('`', '``')}`"
+
+
 def _sql_item_col(item_cols: set[str], name: str, alias: str | None = None) -> str:
     out = alias or name
+    out_sql = _sql_quote_identifier(out)
     if name in item_cols:
-        return f"items.{name} AS {out}"
-    return f"NULL AS {out}"
+        return f"items.{_sql_quote_identifier(name)} AS {out_sql}"
+    return f"NULL AS {out_sql}"
+
+
+_ORDER_LINE_EXPLICIT_ITEM_COLS = {
+    "id",
+    "item_number",
+    "description",
+    "stock_level",
+    "qty_on_order",
+    "purchase_suggestion",
+    "buy_freq",
+    "del_time",
+    "location_name",
+    "location",
+    "last_year_usage",
+    "num_move_last_year",
+    "comment",
+    "active_flag",
+    "purch_sugg_creation_date",
+    "vendor_name",
+    "purchasing_method",
+    "unit_cost",
+    "price",
+}
 
 
 def _order_line_display_item_fields(conn: MySQLConnection) -> str:
@@ -1281,6 +1309,9 @@ def _order_line_display_item_fields(conn: MySQLConnection) -> str:
         f"{unit_sql} AS price",
         manual_sql,
     ]
+    for col_name in sorted(item_cols):
+        if col_name not in _ORDER_LINE_EXPLICIT_ITEM_COLS:
+            parts.append(_sql_item_col(item_cols, col_name))
     return ",\n                ".join(parts)
 
 
