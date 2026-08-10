@@ -4,7 +4,7 @@ import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterator
 
@@ -363,6 +363,16 @@ def _migrate_order_lines_assigned_to_column(conn: MySQLConnection) -> None:
         if not cursor.fetchone():
             cursor.execute(
                 "ALTER TABLE order_lines ADD COLUMN assigned_to INT NULL DEFAULT NULL"
+            )
+    conn.commit()
+
+
+def _migrate_order_lines_purch_sugg_confirmed_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'purch_sugg_confirmed'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN purch_sugg_confirmed TINYINT NOT NULL DEFAULT 0"
             )
     conn.commit()
 
@@ -1069,6 +1079,10 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
     except ValueError:
         pass
     try:
+        _migrate_order_lines_purch_sugg_confirmed_column(conn)
+    except ValueError:
+        pass
+    try:
         _migrate_order_lines_manual_columns(conn)
     except ValueError:
         pass
@@ -1342,7 +1356,8 @@ def _order_items_select_sql(vendor_override_days: int, item_fields: str) -> str:
                 order_lines.deleted AS order_deleted,
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
-                order_lines.assigned_to AS order_assigned_to
+                order_lines.assigned_to AS order_assigned_to,
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
             FROM {{from_clause}}
             {_item_override_join_sql(vendor_override_days)}
             {{where_clause}}
@@ -1469,7 +1484,8 @@ def _fetch_order_item_row(
                 order_lines.deleted AS order_deleted,
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
-                order_lines.assigned_to AS order_assigned_to
+                order_lines.assigned_to AS order_assigned_to,
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
             FROM order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
             LEFT JOIN items ON items.id = order_lines.item_id
@@ -1586,6 +1602,380 @@ def add_order_line(
         return {"order_line_id": line_id, "row": row}
 
 
+def _normalize_order_line_progress(value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        return "Not Started"
+    return str(value).strip()
+
+
+def merge_order_lines_from_order(
+    target_order_id: int,
+    source_order_id: int,
+    *,
+    progress_statuses: list[str] | None = None,
+    set_progress: str | None = None,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Copy/add lines from source order into target (comments, progress, qty_override)."""
+    if target_order_id == source_order_id:
+        raise ValueError("Source and target order must differ")
+
+    include_progress = (
+        {_normalize_order_line_progress(p) for p in progress_statuses}
+        if progress_statuses
+        else None
+    )
+    override_progress = (
+        _normalize_order_line_progress(set_progress) if set_progress else None
+    )
+
+    with connection(database) as conn:
+        _ensure_orders_tables(conn)
+        for oid in (target_order_id, source_order_id):
+            order = _get_single_row(conn, "SELECT id FROM orders WHERE id = %s", (oid,))
+            if not order:
+                raise ValueError(f"Order {oid} not found")
+
+        source_lines = _get_rows(
+            conn,
+            """
+            SELECT
+                id,
+                item_id,
+                is_manual,
+                manual_item_number,
+                manual_description,
+                manual_vendor_name,
+                manual_unit_price,
+                est_delivery_date,
+                qty_suggested,
+                qty_override,
+                order_comments,
+                progress,
+                order_from_location_id,
+                po,
+                assigned_to,
+                status
+            FROM order_lines
+            WHERE order_id = %s
+              AND COALESCE(deleted, 0) = 0
+            ORDER BY id
+            """,
+            (source_order_id,),
+        )
+
+        added = 0
+        updated = 0
+        skipped = 0
+
+        with conn.cursor() as cursor:
+            for line in source_lines:
+                line_progress = _normalize_order_line_progress(line.get("progress"))
+                if include_progress is not None and line_progress not in include_progress:
+                    skipped += 1
+                    continue
+
+                qty = line.get("qty_override")
+                if qty is None:
+                    qty = line.get("qty_suggested")
+                try:
+                    qty_int = int(round(float(qty or 0)))
+                except (TypeError, ValueError):
+                    qty_int = 0
+
+                progress_val = override_progress or line_progress
+                comments = line.get("order_comments")
+
+                item_id = line.get("item_id")
+                is_manual = int(line.get("is_manual") or 0)
+                manual_pn = (line.get("manual_item_number") or "").strip() or None
+
+                existing_id = None
+                if item_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT id FROM order_lines
+                        WHERE order_id = %s
+                          AND item_id = %s
+                          AND COALESCE(deleted, 0) = 0
+                        LIMIT 1
+                        """,
+                        (target_order_id, item_id),
+                    )
+                    row = cursor.fetchone()
+                    existing_id = row[0] if row else None
+                elif is_manual and manual_pn:
+                    cursor.execute(
+                        """
+                        SELECT id FROM order_lines
+                        WHERE order_id = %s
+                          AND COALESCE(is_manual, 0) = 1
+                          AND manual_item_number = %s
+                          AND COALESCE(deleted, 0) = 0
+                        LIMIT 1
+                        """,
+                        (target_order_id, manual_pn),
+                    )
+                    row = cursor.fetchone()
+                    existing_id = row[0] if row else None
+
+                if existing_id:
+                    cursor.execute(
+                        """
+                        UPDATE order_lines
+                        SET qty_override = %s,
+                            progress = %s,
+                            order_comments = %s
+                        WHERE id = %s
+                        """,
+                        (qty_int, progress_val, comments, existing_id),
+                    )
+                    updated += 1
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO order_lines (
+                            order_id,
+                            item_id,
+                            is_manual,
+                            manual_item_number,
+                            manual_description,
+                            manual_vendor_name,
+                            manual_unit_price,
+                            order_date,
+                            est_delivery_date,
+                            qty_suggested,
+                            qty_override,
+                            order_from_location_id,
+                            order_comments,
+                            progress,
+                            po,
+                            assigned_to,
+                            status
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s,
+                            NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            target_order_id,
+                            item_id,
+                            is_manual,
+                            line.get("manual_item_number"),
+                            line.get("manual_description"),
+                            line.get("manual_vendor_name"),
+                            line.get("manual_unit_price"),
+                            line.get("est_delivery_date"),
+                            qty_int,
+                            qty_int,
+                            int(line.get("order_from_location_id") or 0),
+                            comments,
+                            progress_val,
+                            line.get("po"),
+                            line.get("assigned_to"),
+                            line.get("status"),
+                        ),
+                    )
+                    added += 1
+
+        conn.commit()
+
+    return {
+        "target_order_id": target_order_id,
+        "source_order_id": source_order_id,
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+    }
+
+
+# Deep Dive Opt defaults (see purch_sys_customers/src/config/deepDiveDefaults.js)
+DEEP_DIVE_FIXED_SHIPPING_USD = 90.0
+DEEP_DIVE_INTEREST_RATE_PCT = 18.0
+SIM_OPTIMAL_PLAN_VIEW = "v_sim_optimal_plan"
+SIM_OPTIMAL_PLAN_DETAIL_VIEW = "v_sim_optimal_plan_detail"
+SIM_OPTIMAL_PLAN_DAILY_TABLE = "sim_optimal_plan_daily"
+SIM_OPTIMAL_PLAN_DAILY_VIEW = "v_sim_optimal_plan_by_day"
+
+
+def _items_unit_cost_expr(conn: MySQLConnection, alias: str = "i") -> str:
+    """COALESCE(unit_cost, price, 0) — skips zero so price can backfill."""
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    parts: list[str] = []
+    if "unit_cost" in item_cols:
+        parts.append(f"NULLIF({alias}.unit_cost, 0)")
+    if "price" in item_cols:
+        parts.append(f"NULLIF({alias}.price, 0)")
+    if not parts:
+        return "0"
+    if len(parts) == 1:
+        return f"COALESCE({parts[0]}, 0)"
+    return f"COALESCE({parts[0]}, {parts[1]}, 0)"
+
+
+def _coerce_sql_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return date.fromisoformat(text[:10])
+    return None
+
+
+def _sim_optimal_plan_cost_exprs(conn: MySQLConnection, alias: str = "i") -> tuple[str, str, str]:
+    unit_cost = _items_unit_cost_expr(conn, alias)
+    holding_rate = DEEP_DIVE_INTEREST_RATE_PCT / 100.0
+    shipping = DEEP_DIVE_FIXED_SHIPPING_USD
+    inv_value = f"(COALESCE(sr.inv, 0) * ({unit_cost}))"
+    inventory_cost = f"{inv_value} * ({holding_rate} / 365)"
+    fixed_shipping = (
+        f"CASE WHEN COALESCE(sr.deliveries, 0) > 0 THEN {shipping} ELSE 0 END"
+    )
+    return inv_value, inventory_cost, fixed_shipping
+
+
+def _ensure_sim_result_indexes(conn: MySQLConnection) -> None:
+    ensure_table_exists(conn, "sim_result")
+    indexes = {
+        "idx_sim_result_sim_date": "sim_date",
+        "idx_sim_result_item_sim_date": "item_id, sim_date",
+    }
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW INDEX FROM sim_result")
+        existing = {row[2] for row in cursor.fetchall()}
+        for name, columns in indexes.items():
+            if name not in existing:
+                cursor.execute(
+                    f"CREATE INDEX {quote_ident(name)} ON sim_result ({columns})"
+                )
+    conn.commit()
+
+
+def _ensure_sim_optimal_plan_daily_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)} (
+                dags DATE NOT NULL PRIMARY KEY,
+                inv_value DECIMAL(18, 2) NOT NULL DEFAULT 0,
+                inventory_cost DECIMAL(18, 6) NOT NULL DEFAULT 0,
+                fixed_shipping_cost DECIMAL(18, 2) NOT NULL DEFAULT 0
+            ) ENGINE=InnoDB
+            """
+        )
+    conn.commit()
+
+
+def refresh_sim_optimal_plan_daily(conn: MySQLConnection, dates: list[Any] | None = None) -> int:
+    """Rebuild daily aggregates. If dates given, refresh only those days (fast after sim upsert)."""
+    ensure_table_exists(conn, "sim_result")
+    ensure_table_exists(conn, "items")
+    _ensure_sim_optimal_plan_daily_table(conn)
+    inv_value, inventory_cost, fixed_shipping = _sim_optimal_plan_cost_exprs(conn, "i")
+    aggregate_select = f"""
+        SELECT
+            sr.sim_date AS dags,
+            SUM({inv_value}) AS inv_value,
+            SUM({inventory_cost}) AS inventory_cost,
+            SUM({fixed_shipping}) AS fixed_shipping_cost
+        FROM sim_result sr
+        INNER JOIN items i ON i.id = sr.item_id
+    """
+    with conn.cursor() as cursor:
+        if not dates:
+            cursor.execute(f"TRUNCATE TABLE {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)}")
+            cursor.execute(
+                f"""
+                INSERT INTO {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)}
+                    (dags, inv_value, inventory_cost, fixed_shipping_cost)
+                {aggregate_select}
+                GROUP BY sr.sim_date
+                """
+            )
+        else:
+            unique_dates = sorted(
+                {d for d in (_coerce_sql_date(d) for d in dates) if d is not None}
+            )
+            if not unique_dates:
+                conn.commit()
+                return 0
+            placeholders = ",".join(["%s"] * len(unique_dates))
+            cursor.execute(
+                f"DELETE FROM {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)} WHERE dags IN ({placeholders})",
+                unique_dates,
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)}
+                    (dags, inv_value, inventory_cost, fixed_shipping_cost)
+                {aggregate_select}
+                WHERE sr.sim_date IN ({placeholders})
+                GROUP BY sr.sim_date
+                """,
+                unique_dates,
+            )
+        row_count = cursor.rowcount
+    conn.commit()
+    return row_count
+
+
+def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
+    """
+    Daily cost view from latest sim_result + items (Deep Dive / optimal plan).
+
+    - inv_value: inv × unit cost
+    - inventory_cost: daily holding cost @ 18% árlega (18/365 per day)
+    - fixed_shipping_cost: 90 USD on days with deliveries > 0 in sim_result
+    """
+    _ensure_sim_result_indexes(conn)
+    ensure_table_exists(conn, "sim_result")
+    ensure_table_exists(conn, "items")
+    inv_value, inventory_cost, fixed_shipping = _sim_optimal_plan_cost_exprs(conn, "i")
+    detail_view_sql = f"""
+        CREATE OR REPLACE VIEW {quote_ident(SIM_OPTIMAL_PLAN_DETAIL_VIEW)} AS
+        SELECT
+            sr.item_id AS item_id,
+            sr.sim_date AS dags,
+            {inv_value} AS inv_value,
+            {inventory_cost} AS inventory_cost,
+            {fixed_shipping} AS fixed_shipping_cost
+        FROM sim_result sr
+        INNER JOIN items i ON i.id = sr.item_id
+    """
+    daily_view_sql = f"""
+        CREATE OR REPLACE VIEW {quote_ident(SIM_OPTIMAL_PLAN_VIEW)} AS
+        SELECT
+            dags,
+            inv_value,
+            inventory_cost,
+            fixed_shipping_cost
+        FROM {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)}
+    """
+    daily_alias_sql = f"""
+        CREATE OR REPLACE VIEW {quote_ident(SIM_OPTIMAL_PLAN_DAILY_VIEW)} AS
+        SELECT
+            dags,
+            inv_value,
+            inventory_cost,
+            fixed_shipping_cost
+        FROM {quote_ident(SIM_OPTIMAL_PLAN_DAILY_TABLE)}
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(detail_view_sql)
+        _ensure_sim_optimal_plan_daily_table(conn)
+        cursor.execute(daily_view_sql)
+        cursor.execute(daily_alias_sql)
+    refresh_sim_optimal_plan_daily(conn)
+    conn.commit()
+
+
 def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
     if not rows:
         return 0
@@ -1595,6 +1985,13 @@ def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -
     with connection(database) as conn:
         with conn.cursor() as cursor:
             fmt = ",".join(["%s"] * len(item_ids))
+            cursor.execute(
+                f"SELECT DISTINCT sim_date FROM sim_result WHERE item_id IN ({fmt})",
+                item_ids,
+            )
+            dates_before = {
+                d for d in (_coerce_sql_date(r[0]) for r in cursor.fetchall()) if d is not None
+            }
             cursor.execute(f"DELETE FROM sim_result WHERE item_id IN ({fmt})", item_ids)
 
             cursor.executemany(
@@ -1607,7 +2004,12 @@ def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -
                 """,
                 rows,
             )
-        conn.commit()
+        dates_after = {
+            d
+            for d in (_coerce_sql_date(row.get("sim_date")) for row in rows)
+            if d is not None
+        }
+        refresh_sim_optimal_plan_daily(conn, dates=list(dates_before | dates_after))
         return len(rows)
 
 

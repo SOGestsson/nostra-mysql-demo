@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from app import db
+
+HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 
 class NativeEditorConfig(BaseModel):
@@ -45,6 +48,30 @@ class DbUiConfigPayload(BaseModel):
     columnLabels: dict[str, str] = Field(default_factory=dict)
     catalogTable: str = "items"
     vendorOverrideDays: int = Field(default=30, ge=0, le=3650)
+    progressStatusColors: dict[str, str] = Field(default_factory=dict)
+
+
+def _normalize_hex_color(value: str) -> str:
+    color = str(value).strip()
+    if not HEX_COLOR_RE.match(color):
+        raise ValueError(f"Invalid hex color '{color}'. Use values like #ff8800.")
+    if len(color) == 4:
+        return "#" + "".join(ch * 2 for ch in color[1:])
+    return color.lower()
+
+
+def _validate_progress_status_colors(raw: dict[str, str]) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for key, value in (raw or {}).items():
+        status = str(key).strip()
+        if not status:
+            continue
+        validated[status] = _normalize_hex_color(value)
+    return validated
+
+
+def validate_progress_status_colors(raw: dict[str, str]) -> dict[str, str]:
+    return _validate_progress_status_colors(raw)
 
 
 def _parse_editor(raw: dict[str, Any]) -> ColumnEditorConfig:
@@ -122,4 +149,5 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
         for key, value in payload.columnLabels.items()
         if value and value.strip()
     }
+    result["progressStatusColors"] = _validate_progress_status_colors(payload.progressStatusColors)
     return result

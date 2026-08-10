@@ -8,7 +8,7 @@ from typing import Any
 import mysql.connector
 from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import db, auth as auth_module, ui_config as ui_config_module
 
@@ -75,6 +75,12 @@ class AddOrderLinePayload(BaseModel):
     unit_price: float | None = None
 
 
+class MergeOrderLinesPayload(BaseModel):
+    source_order_id: int
+    progress_statuses: list[str] | None = None
+    set_progress: str | None = None
+
+
 class ResetPurchaseSuggestionsPayload(BaseModel):
     item_ids: list[int] | None = None
     source_order_id: int | None = None
@@ -89,8 +95,14 @@ class UserDbConfigPayload(BaseModel):
     ordersColumnWidths: dict[str, int] | None = None
     catalogFrozenColumnCount: int | None = None
     ordersFrozenColumnCount: int | None = None
+    catalogShowRowNumbers: bool | None = None
+    ordersShowRowNumbers: bool | None = None
     catalogGridPaging: str | None = None
     ordersGridPaging: str | None = None
+
+
+class ProgressStatusColorsPayload(BaseModel):
+    progressStatusColors: dict[str, str] = Field(default_factory=dict)
 
 
 class ManualVendorPayload(BaseModel):
@@ -201,6 +213,8 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
             **({"ordersColumnWidths": user_config["ordersColumnWidths"]} if "ordersColumnWidths" in user_config else {}),
             **({"catalogFrozenColumnCount": user_config["catalogFrozenColumnCount"]} if "catalogFrozenColumnCount" in user_config else {}),
             **({"ordersFrozenColumnCount": user_config["ordersFrozenColumnCount"]} if "ordersFrozenColumnCount" in user_config else {}),
+            **({"catalogShowRowNumbers": user_config["catalogShowRowNumbers"]} if "catalogShowRowNumbers" in user_config else {}),
+            **({"ordersShowRowNumbers": user_config["ordersShowRowNumbers"]} if "ordersShowRowNumbers" in user_config else {}),
             **({"catalogGridPaging": user_config["catalogGridPaging"]} if "catalogGridPaging" in user_config else {}),
             **({"ordersGridPaging": user_config["ordersGridPaging"]} if "ordersGridPaging" in user_config else {}),
         }
@@ -225,6 +239,30 @@ def set_user_db_config(
         return {"db_name": db_name, "config": merged}
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.put("/db-config/{db_name}/progress-colors")
+def set_progress_status_colors(
+    db_name: str,
+    payload: ProgressStatusColorsPayload,
+    authorization: str = Header(default=""),
+) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.require_db_users_access(token, db_name)
+        existing = auth_module.get_db_ui_config(db_name)
+        progress_status_colors = ui_config_module.validate_progress_status_colors(
+            payload.progressStatusColors,
+        )
+        merged = {**existing, "progressStatusColors": progress_status_colors}
+        auth_module.set_db_ui_config(db_name, merged)
+        return {"db_name": db_name, "progressStatusColors": progress_status_colors}
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 401 if message in {"Token expired", "Invalid token"} else 403
+        if message.startswith("Invalid hex color"):
+            status_code = 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
 
 
 @app.put("/admin/db-config/{db_name}")
@@ -640,6 +678,32 @@ def add_order_line(
             database=db_name,
         )
         return result
+    except ValueError as exc:
+        detail = str(exc)
+        if detail.startswith("Order "):
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/orders/{order_id}/merge-from-order", status_code=status.HTTP_200_OK)
+def merge_order_lines_from_order(
+    order_id: int,
+    payload: MergeOrderLinesPayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        return db.merge_order_lines_from_order(
+            target_order_id=order_id,
+            source_order_id=payload.source_order_id,
+            progress_statuses=payload.progress_statuses,
+            set_progress=payload.set_progress,
+            database=db_name,
+        )
     except ValueError as exc:
         detail = str(exc)
         if detail.startswith("Order "):
