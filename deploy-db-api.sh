@@ -34,6 +34,8 @@ REMOTE_CMD="
     -e MASTER_DB_USER=root \
     -e MASTER_DB_PASSWORD=Superman \
     -e JWT_SECRET=nostradamus-secret-key \
+    -e FORECAST_API_URL=${FORECAST_API_URL:-https://api.nostradamus-api.com} \
+    -e FORECAST_API_TIMEOUT=${FORECAST_API_TIMEOUT:-120} \
     $IMAGE &&
   HEALTH_URL='http://127.0.0.1:$PORT/tables/items/rows?db=consumables&limit=1' &&
   ok=0 &&

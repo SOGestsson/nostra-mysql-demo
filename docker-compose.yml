@@ -17,4 +17,6 @@ services:
       MASTER_DB_USER: ${MASTER_DB_USER:-root}
       MASTER_DB_PASSWORD: ${MASTER_DB_PASSWORD:-${MYSQL_PASSWORD}}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      FORECAST_API_URL: ${FORECAST_API_URL:-https://api.nostradamus-api.com}
+      FORECAST_API_TIMEOUT: ${FORECAST_API_TIMEOUT:-120}
     restart: unless-stopped

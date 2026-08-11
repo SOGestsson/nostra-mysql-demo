@@ -22,6 +22,8 @@ FastAPI REST API sem tengist MySQL og býður upp á generic CRUD, JWT auth, adm
 | `MASTER_DB_USER` | Master DB notandi | `MYSQL_USER` |
 | `MASTER_DB_PASSWORD` | Master DB lykilorð | `MYSQL_PASSWORD` |
 | `JWT_SECRET` | Undirritun JWT | *(í kóða — breyttu í prod!)* |
+| `FORECAST_API_URL` | Nostradamus forecast API | `https://api.nostradamus-api.com` |
+| `FORECAST_API_TIMEOUT` | Timeout (sek) á forecast köll | `120` |
 
 Flestar aðgerðir styðja `?db=<database_name>` til að velja gagnagrunn úr `nostradamus_master.database_connections`.
 
@@ -111,6 +113,28 @@ API: `http://raspberrypi.local:8001/docs`
 - `GET /sim-prep?db=&item_ids=`
 - `POST /sim-result?db=`
 - `POST /purchase-suggestions?db=`
+
+### Classical forecast
+
+Spár eru **ekki reiknaðar hér** — `db-api` sækir söguna úr MySQL, kallar á
+`nostradamus-api` (`POST /api/v1/forecast/generate`, StatsForecast) og vistar
+niðurstöðuna í `forecast_result` töfluna. Stýrt með `FORECAST_API_URL`.
+
+- `GET /forecast/models` — studdar `local_model` gildi
+- `POST /forecast/run/{item_id}?db=&forecast_periods=&local_model=&freq=&persist=`
+- `POST /forecast/run-batch?db=` — body `{"item_ids": [1, 2, 3]}`
+- `GET /forecast/{item_id}?db=&limit=`
+- `GET /health?check_engine=true` — athugar hvort forecast API svarar
+
+Allir forecast endapunktar krefjast JWT. `persist=false` keyrir spá án þess að
+skrifa í gagnagrunninn (gagnlegt í prófunum).
+
+`forecast_result` verður til sjálfkrafa við fyrstu skrif; til að stofna hana
+fyrirfram:
+
+```bash
+python scripts/add_forecast_result_to_dbs.py --all
+```
 
 ### UI config og lookup
 

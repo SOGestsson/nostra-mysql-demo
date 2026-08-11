@@ -2013,6 +2013,102 @@ def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -
         return len(rows)
 
 
+FORECAST_RESULT_TABLE = "forecast_result"
+
+
+def _ensure_forecast_result_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quote_ident(FORECAST_RESULT_TABLE)} (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                item_id INT NOT NULL,
+                forecast_date DATE NOT NULL,
+                forecast DECIMAL(18, 4) NULL,
+                upper_70 DECIMAL(18, 4) NULL,
+                upper_90 DECIMAL(18, 4) NULL,
+                upper_95 DECIMAL(18, 4) NULL,
+                model_used VARCHAR(64) NULL,
+                freq VARCHAR(8) NOT NULL DEFAULT 'D',
+                run_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_forecast_item_date (item_id, forecast_date),
+                KEY idx_forecast_item (item_id)
+            )
+            """
+        )
+    conn.commit()
+
+
+def upsert_forecast_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
+    if not rows:
+        return 0
+
+    prepared: list[dict[str, Any]] = []
+    for row in rows:
+        forecast_date = _coerce_sql_date(row.get("forecast_date"))
+        if forecast_date is None or row.get("item_id") is None:
+            continue
+        prepared.append(
+            {
+                "item_id": int(row["item_id"]),
+                "forecast_date": forecast_date,
+                "forecast": row.get("forecast"),
+                "upper_70": row.get("upper_70"),
+                "upper_90": row.get("upper_90"),
+                "upper_95": row.get("upper_95"),
+                "model_used": row.get("model_used"),
+                "freq": row.get("freq") or "D",
+            }
+        )
+
+    if not prepared:
+        return 0
+
+    item_ids = list({row["item_id"] for row in prepared})
+
+    with connection(database) as conn:
+        _ensure_forecast_result_table(conn)
+        with conn.cursor() as cursor:
+            fmt = ",".join(["%s"] * len(item_ids))
+            cursor.execute(
+                f"DELETE FROM {quote_ident(FORECAST_RESULT_TABLE)} WHERE item_id IN ({fmt})",
+                item_ids,
+            )
+            cursor.executemany(
+                f"""
+                INSERT INTO {quote_ident(FORECAST_RESULT_TABLE)}
+                    (item_id, forecast_date, forecast, upper_70, upper_90, upper_95, model_used, freq)
+                VALUES
+                    (%(item_id)s, %(forecast_date)s, %(forecast)s, %(upper_70)s,
+                     %(upper_90)s, %(upper_95)s, %(model_used)s, %(freq)s)
+                """,
+                prepared,
+            )
+        conn.commit()
+        return len(prepared)
+
+
+def get_forecast_result(
+    item_id: int,
+    database: str | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    with connection(database) as conn:
+        _ensure_forecast_result_table(conn)
+        return _get_rows(
+            conn,
+            f"""
+            SELECT item_id, forecast_date, forecast, upper_70, upper_90, upper_95,
+                   model_used, freq, run_at
+            FROM {quote_ident(FORECAST_RESULT_TABLE)}
+            WHERE item_id = %s
+            ORDER BY forecast_date
+            LIMIT %s
+            """,
+            (item_id, limit),
+        )
+
+
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     normalized: dict[str, Any] = {}
     for key, value in row.items():

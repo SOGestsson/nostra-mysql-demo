@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app import db, auth as auth_module, ui_config as ui_config_module
+from app import db, auth as auth_module, forecast as forecast_module, ui_config as ui_config_module
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,10 @@ class ProgressStatusColorsPayload(BaseModel):
 
 class ManualVendorPayload(BaseModel):
     vendor_name: str
+
+
+class ForecastBatchPayload(BaseModel):
+    item_ids: list[int]
 
 
 class ReplaceSyncedVendorsPayload(BaseModel):
@@ -415,14 +419,17 @@ def admin_replace_synced_vendors(
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health(check_engine: bool = Query(default=False)) -> dict[str, Any]:
     try:
         with db.connection() as conn, conn.cursor() as cursor:
             cursor.execute("SELECT 1")
             cursor.fetchone()
-        return {"status": "ok"}
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc.msg}") from exc
+
+    if check_engine:
+        return {"status": "ok", "forecast_engine": forecast_module.health()}
+    return {"status": "ok"}
 
 
 @app.get("/databases")
@@ -790,6 +797,177 @@ def forecast_input(
         message = str(exc)
         status_code = 404 if message.startswith("Item not found") else 400
         raise HTTPException(status_code=status_code, detail=message) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/forecast/models")
+def forecast_models(authorization: str = Header(default="")) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        return {"models": forecast_module.SUPPORTED_MODELS}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.post("/forecast/run/{item_id}")
+def run_forecast(
+    item_id: int,
+    db_name: str = Query(..., alias="db"),
+    forecast_periods: int = Query(default=30, ge=1),
+    mode: str = Query(default="local"),
+    local_model: str = Query(default="auto_arima"),
+    season_length: int = Query(default=7, ge=1),
+    freq: str = Query(default="D"),
+    start_day: date | None = Query(default=None),
+    end_day: date | None = Query(default=None),
+    persist: bool = Query(default=True),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        forecast_module.validate_model(local_model, mode)
+
+        payload = db.get_forecast_input_data(
+            item_id=item_id,
+            forecast_periods=forecast_periods,
+            mode=mode,
+            local_model=local_model,
+            season_length=season_length,
+            freq=freq,
+            start_day=start_day,
+            end_day=end_day,
+            database=db_name,
+        )
+        envelope = forecast_module.generate(payload)
+        rows, failed = forecast_module.parse_response(envelope, freq)
+
+        saved = db.upsert_forecast_result(rows, database=db_name) if persist and rows else 0
+        return {
+            "item_id": item_id,
+            "persisted": bool(persist and rows),
+            "saved": saved,
+            "model_used": rows[0]["model_used"] if rows else None,
+            "forecast": rows,
+            "failed": failed,
+        }
+    except forecast_module.ForecastEngineError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except ValueError as exc:
+        message = str(exc)
+        if message in ("Token expired", "Invalid token"):
+            status_code = 401
+        elif message.startswith("Item not found"):
+            status_code = 404
+        else:
+            status_code = 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/forecast/run-batch")
+def run_forecast_batch(
+    payload: ForecastBatchPayload,
+    db_name: str = Query(..., alias="db"),
+    forecast_periods: int = Query(default=30, ge=1),
+    mode: str = Query(default="local"),
+    local_model: str = Query(default="auto_arima"),
+    season_length: int = Query(default=7, ge=1),
+    freq: str = Query(default="D"),
+    start_day: date | None = Query(default=None),
+    end_day: date | None = Query(default=None),
+    persist: bool = Query(default=True),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        forecast_module.validate_model(local_model, mode)
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 401 if message in ("Token expired", "Invalid token") else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="item_ids must not be empty")
+
+    def build_one(item_id: int) -> tuple[int, dict | Exception]:
+        try:
+            return item_id, db.get_forecast_input_data(
+                item_id=item_id,
+                forecast_periods=forecast_periods,
+                mode=mode,
+                local_model=local_model,
+                season_length=season_length,
+                freq=freq,
+                start_day=start_day,
+                end_day=end_day,
+                database=db_name,
+            )
+        except Exception as exc:
+            return item_id, exc
+
+    history: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(build_one, item_id) for item_id in payload.item_ids]
+        for future in as_completed(futures):
+            item_id, result = future.result()
+            if isinstance(result, Exception):
+                skipped.append({"item_id": item_id, "error": str(result)})
+                continue
+            history.extend(result.get("sim_input_his") or [])
+
+    if not history:
+        return {"saved": 0, "items": 0, "skipped": skipped, "failed": []}
+
+    engine_payload = {
+        "sim_input_his": history,
+        "forecast_periods": forecast_periods,
+        "mode": mode,
+        "local_model": local_model,
+        "season_length": season_length,
+        "freq": freq,
+    }
+
+    try:
+        envelope = forecast_module.generate(engine_payload)
+        rows, failed = forecast_module.parse_response(envelope, freq)
+        saved = db.upsert_forecast_result(rows, database=db_name) if persist and rows else 0
+    except forecast_module.ForecastEngineError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+    if skipped:
+        logger.warning("forecast run-batch skipped items: %s", [s["item_id"] for s in skipped])
+
+    return {
+        "saved": saved,
+        "persisted": bool(persist and rows),
+        "items": len({row["item_id"] for row in rows}),
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+@app.get("/forecast/{item_id}")
+def get_forecast(
+    item_id: int,
+    db_name: str = Query(..., alias="db"),
+    limit: int = Query(default=1000, ge=1, le=20000),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        auth_module.verify_token(token)
+        rows = db.get_forecast_result(item_id=item_id, database=db_name, limit=limit)
+        return {"item_id": item_id, "count": len(rows), "rows": rows}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
