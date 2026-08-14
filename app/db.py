@@ -1976,6 +1976,70 @@ def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
     conn.commit()
 
 
+SIM_OPTIMAL_PLAN_ITEM_ID_BATCH = 1000
+
+
+def get_sim_optimal_plan_timeseries(
+    database: str | None = None,
+    item_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Daily inv/cost/shipping series from optimal-plan views."""
+    with connection(database) as conn:
+        if not item_ids:
+            ensure_table_exists(conn, SIM_OPTIMAL_PLAN_VIEW)
+            query = f"""
+                SELECT
+                    dags,
+                    inv_value,
+                    inventory_cost,
+                    fixed_shipping_cost
+                FROM {quote_ident(SIM_OPTIMAL_PLAN_VIEW)}
+                ORDER BY dags
+            """
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+            return [normalize_row(row) for row in rows]
+
+        ensure_table_exists(conn, SIM_OPTIMAL_PLAN_DETAIL_VIEW)
+        unique_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+        if not unique_ids:
+            return []
+
+        totals_by_day: dict[Any, dict[str, Any]] = {}
+        for offset in range(0, len(unique_ids), SIM_OPTIMAL_PLAN_ITEM_ID_BATCH):
+            batch = unique_ids[offset : offset + SIM_OPTIMAL_PLAN_ITEM_ID_BATCH]
+            placeholders = ",".join(["%s"] * len(batch))
+            query = f"""
+                SELECT
+                    dags,
+                    SUM(inv_value) AS inv_value,
+                    SUM(inventory_cost) AS inventory_cost,
+                    SUM(fixed_shipping_cost) AS fixed_shipping_cost
+                FROM {quote_ident(SIM_OPTIMAL_PLAN_DETAIL_VIEW)}
+                WHERE item_id IN ({placeholders})
+                GROUP BY dags
+            """
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(query, batch)
+                for row in cursor.fetchall():
+                    day = row["dags"]
+                    if day not in totals_by_day:
+                        totals_by_day[day] = {
+                            "dags": day,
+                            "inv_value": 0.0,
+                            "inventory_cost": 0.0,
+                            "fixed_shipping_cost": 0.0,
+                        }
+                    bucket = totals_by_day[day]
+                    bucket["inv_value"] += float(row["inv_value"] or 0)
+                    bucket["inventory_cost"] += float(row["inventory_cost"] or 0)
+                    bucket["fixed_shipping_cost"] += float(row["fixed_shipping_cost"] or 0)
+
+        rows = sorted(totals_by_day.values(), key=lambda row: row["dags"])
+        return [normalize_row(row) for row in rows]
+
+
 def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
     if not rows:
         return 0

@@ -122,6 +122,12 @@ API: `http://raspberrypi.local:8001/docs`
 
 Dæmi um consumables config: [`config/consumables_ui_config.example.json`](config/consumables_ui_config.example.json)
 
+Notenda-stillingar (`PUT /user/db-config/{db_name}`) geta m.a. innihaldið:
+
+- `catalogSavedWhereFilters` / `ordersSavedWhereFilters` — listi af `{ id, name, expression, enabled }`
+- `catalogShowRowNumbers` / `ordersShowRowNumbers` — boolean
+- `catalogGridPaging` / `ordersGridPaging` — `"pages"` eða `"scroll"`
+
 ```bash
 ADMIN_TOKEN=<admin-jwt> DB_NAME=consumables ./scripts/set_consumables_config.sh
 ```

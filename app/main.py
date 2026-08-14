@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app import db, auth as auth_module, ui_config as ui_config_module
+from app import db, auth as auth_module, ui_config as ui_config_module, assistant as assistant_module
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,10 @@ class ResetPurchaseSuggestionsPayload(BaseModel):
     source_order_id: int | None = None
 
 
+class SimOptimalPlanTimeseriesPayload(BaseModel):
+    item_ids: list[int] | None = None
+
+
 class UserDbConfigPayload(BaseModel):
     visibleColumns: list[str] | None = None
     filterableColumns: list[str] | None = None
@@ -97,8 +101,17 @@ class UserDbConfigPayload(BaseModel):
     ordersFrozenColumnCount: int | None = None
     catalogShowRowNumbers: bool | None = None
     ordersShowRowNumbers: bool | None = None
+    catalogSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
+    ordersSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
     catalogGridPaging: str | None = None
     ordersGridPaging: str | None = None
+    optimalPlanVisibleColumns: list[str] | None = None
+    optimalPlanFilterableColumns: list[str] | None = None
+    optimalPlanColumnWidths: dict[str, int] | None = None
+    optimalPlanFrozenColumnCount: int | None = None
+    optimalPlanShowRowNumbers: bool | None = None
+    optimalPlanGridPaging: str | None = None
+    optimalPlanSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
 
 
 class ProgressStatusColorsPayload(BaseModel):
@@ -202,7 +215,9 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
     try:
         user = auth_module.verify_token(token)
         admin_config = auth_module.get_db_ui_config(db_name)
-        user_config = auth_module.get_user_ui_config(user["id"], db_name)
+        user_config = ui_config_module.normalize_user_db_config(
+            auth_module.get_user_ui_config(user["id"], db_name),
+        )
         merged = {
             **admin_config,
             **({"visibleColumns": user_config["visibleColumns"]} if "visibleColumns" in user_config else {}),
@@ -215,8 +230,17 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
             **({"ordersFrozenColumnCount": user_config["ordersFrozenColumnCount"]} if "ordersFrozenColumnCount" in user_config else {}),
             **({"catalogShowRowNumbers": user_config["catalogShowRowNumbers"]} if "catalogShowRowNumbers" in user_config else {}),
             **({"ordersShowRowNumbers": user_config["ordersShowRowNumbers"]} if "ordersShowRowNumbers" in user_config else {}),
+            **({"catalogSavedWhereFilters": user_config["catalogSavedWhereFilters"]} if "catalogSavedWhereFilters" in user_config else {}),
+            **({"ordersSavedWhereFilters": user_config["ordersSavedWhereFilters"]} if "ordersSavedWhereFilters" in user_config else {}),
             **({"catalogGridPaging": user_config["catalogGridPaging"]} if "catalogGridPaging" in user_config else {}),
             **({"ordersGridPaging": user_config["ordersGridPaging"]} if "ordersGridPaging" in user_config else {}),
+            **({"optimalPlanVisibleColumns": user_config["optimalPlanVisibleColumns"]} if "optimalPlanVisibleColumns" in user_config else {}),
+            **({"optimalPlanFilterableColumns": user_config["optimalPlanFilterableColumns"]} if "optimalPlanFilterableColumns" in user_config else {}),
+            **({"optimalPlanColumnWidths": user_config["optimalPlanColumnWidths"]} if "optimalPlanColumnWidths" in user_config else {}),
+            **({"optimalPlanFrozenColumnCount": user_config["optimalPlanFrozenColumnCount"]} if "optimalPlanFrozenColumnCount" in user_config else {}),
+            **({"optimalPlanShowRowNumbers": user_config["optimalPlanShowRowNumbers"]} if "optimalPlanShowRowNumbers" in user_config else {}),
+            **({"optimalPlanGridPaging": user_config["optimalPlanGridPaging"]} if "optimalPlanGridPaging" in user_config else {}),
+            **({"optimalPlanSavedWhereFilters": user_config["optimalPlanSavedWhereFilters"]} if "optimalPlanSavedWhereFilters" in user_config else {}),
         }
         return {"db_name": db_name, "config": merged, "admin_config": admin_config}
     except ValueError as exc:
@@ -234,11 +258,15 @@ def set_user_db_config(
         user = auth_module.verify_token(token)
         existing = auth_module.get_user_ui_config(user["id"], db_name)
         updates = payload.model_dump(exclude_none=True)
-        merged = {**existing, **updates}
+        validated_updates = ui_config_module.validate_user_db_config_updates(updates)
+        merged = ui_config_module.normalize_user_db_config({**existing, **validated_updates})
         auth_module.set_user_ui_config(user["id"], db_name, merged)
         return {"db_name": db_name, "config": merged}
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        message = str(exc)
+        if message in {"Token expired", "Invalid token"}:
+            raise HTTPException(status_code=401, detail=message) from exc
+        raise HTTPException(status_code=400, detail=message) from exc
 
 
 @app.put("/db-config/{db_name}/progress-colors")
@@ -304,6 +332,41 @@ def login(payload: LoginRequest) -> dict:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/assistant/providers", response_model=assistant_module.AssistantProvidersResponse)
+def assistant_providers(
+    authorization: str = Header(default=""),
+) -> assistant_module.AssistantProvidersResponse:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        auth_module.verify_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return assistant_module.list_assistant_providers()
+
+
+@app.post("/assistant/chat", response_model=assistant_module.AssistantChatResponse)
+def assistant_chat(
+    payload: assistant_module.AssistantChatRequest,
+    authorization: str = Header(default=""),
+) -> assistant_module.AssistantChatResponse:
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        auth_module.verify_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    try:
+        return assistant_module.run_assistant_chat(payload)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("assistant chat failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.put("/items/{item_id}/vendor-override")
@@ -533,6 +596,23 @@ def save_sim_result(
         rows = [row.model_dump() for row in payload.sim_result]
         count = db.upsert_sim_result(rows, database=db_name)
         return {"saved": count}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/sim-optimal-plan/timeseries", status_code=status.HTTP_200_OK)
+def sim_optimal_plan_timeseries(
+    payload: SimOptimalPlanTimeseriesPayload,
+    db_name: str = Query(..., alias="db"),
+) -> dict[str, Any]:
+    try:
+        series = db.get_sim_optimal_plan_timeseries(
+            database=db_name,
+            item_ids=payload.item_ids,
+        )
+        return {"series": series}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
