@@ -798,9 +798,15 @@ def get_sim_input_data(
                 for row in on_order_rows
             ]
 
+        stock_level, sim_rio_on_order = _apply_due_on_order_to_stock(
+            sim_rio_on_order,
+            _to_number(item.get("stock_level"), default=0),
+            as_of_day=series_end,
+        )
+
         sim_rio_items = [
             {
-                "actual_stock": _to_number(item.get("stock_level"), default=0),
+                "actual_stock": stock_level,
                 "buy_freq": _to_number(item.get("buy_freq"), default=0),
                 "del_time": _to_number(item.get("del_time"), default=0),
                 "description": item.get("description") or item.get("item_number"),
@@ -1827,6 +1833,25 @@ def _coerce_sql_date(value: Any) -> date | None:
             return None
         return date.fromisoformat(text[:10])
     return None
+
+
+def _apply_due_on_order_to_stock(
+    sim_rio_on_order: list[dict[str, Any]],
+    stock_level: int | float,
+    as_of_day: date | None = None,
+) -> tuple[int | float, list[dict[str, Any]]]:
+    """Qty due on/before as_of_day counts as inbound stock; only future rows stay on order."""
+    ref = as_of_day or date.today()
+    due_qty = 0.0
+    future_rows: list[dict[str, Any]] = []
+    for row in sim_rio_on_order:
+        qty = _to_number(row.get("est_deliv_qty"), default=0)
+        deliv_day = _coerce_sql_date(row.get("est_deliv_date"))
+        if deliv_day is not None and deliv_day <= ref:
+            due_qty += qty
+            continue
+        future_rows.append(row)
+    return _to_number(stock_level, default=0) + due_qty, future_rows
 
 
 def _sim_optimal_plan_cost_exprs(conn: MySQLConnection, alias: str = "i") -> tuple[str, str, str]:
