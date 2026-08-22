@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -10,6 +11,8 @@ from typing import Any, Iterator
 
 import mysql.connector
 from mysql.connector import MySQLConnection
+
+from app.sql_filter import append_sql_filter, combine_sql_filters, migrate_table_sql_filters
 
 DEFAULT_VENDOR_OVERRIDE_DAYS = 30
 
@@ -46,10 +49,9 @@ def _get_db_config(name: str) -> dict:
     return row
 
 
-def _get_vendor_override_days(name: str | None) -> int:
+def _get_ui_config(name: str | None) -> dict[str, Any]:
     if not name:
-        return DEFAULT_VENDOR_OVERRIDE_DAYS
-
+        return {}
     master = mysql.connector.connect(
         host=os.getenv("MASTER_DB_HOST", "raspberrypi.local"),
         port=int(os.getenv("MASTER_DB_PORT", "4406")),
@@ -63,16 +65,113 @@ def _get_vendor_override_days(name: str | None) -> int:
             row = cursor.fetchone()
     finally:
         master.close()
-
     if not row:
-        return DEFAULT_VENDOR_OVERRIDE_DAYS
-
+        return {}
     try:
-        days = int(json.loads(row["config_json"]).get("vendorOverrideDays", DEFAULT_VENDOR_OVERRIDE_DAYS))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return DEFAULT_VENDOR_OVERRIDE_DAYS
+        config = json.loads(row["config_json"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
 
+
+def _get_vendor_override_days(name: str | None) -> int:
+    try:
+        days = int(_get_ui_config(name).get("vendorOverrideDays", DEFAULT_VENDOR_OVERRIDE_DAYS))
+    except (TypeError, ValueError):
+        return DEFAULT_VENDOR_OVERRIDE_DAYS
     return max(0, min(days, 3650))
+
+
+def _table_sql_filters(database: str | None) -> dict[str, str]:
+    return migrate_table_sql_filters(_get_ui_config(database))
+
+
+_WRAPPED_CONSUMPTION_DATE_RE = re.compile(r"(?i)DATE\s*\(\s*`?consumption_date`?\s*\)")
+_BARE_CONSUMPTION_DATE_RE = re.compile(r"(?i)(?<![\w.])`?consumption_date`?(?![\w])")
+
+
+def _wrap_item_histories_date_filter(expression: str) -> str:
+    text = (expression or "").strip()
+    if not text or _WRAPPED_CONSUMPTION_DATE_RE.search(text):
+        return text
+    return _BARE_CONSUMPTION_DATE_RE.sub("DATE(`consumption_date`)", text)
+
+
+def _sql_filter_for_table(database: str | None, table_name: str | None) -> str:
+    table = str(table_name or "").strip()
+    if not table:
+        return ""
+    expression = _table_sql_filters(database).get(table, "")
+    if table == "item_histories":
+        return _wrap_item_histories_date_filter(expression)
+    return expression
+
+
+def _sql_filter_for_tables(database: str | None, *table_names: str) -> str:
+    filters = _table_sql_filters(database)
+    parts: list[str] = []
+    for name in table_names:
+        if not name:
+            continue
+        expression = filters.get(name, "")
+        if name == "item_histories":
+            expression = _wrap_item_histories_date_filter(expression)
+        if expression:
+            parts.append(expression)
+    return combine_sql_filters(*parts)
+
+
+def _as_python_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _fetch_item_history_sales(
+    conn: MySQLConnection,
+    database: str | None,
+    item_id: int,
+    item_number: str = "",
+) -> list[dict[str, Any]]:
+    hist_cols = {c.name for c in get_columns(conn, "item_histories")}
+    if "item_id" in hist_cols:
+        where = "WHERE `item_id` = %s"
+        params: tuple[Any, ...] = (item_id,)
+    else:
+        where = "WHERE `item_number` = %s"
+        params = (item_number,)
+    where = append_sql_filter(where, _sql_filter_for_table(database, "item_histories"))
+    rows = _get_rows(
+        conn,
+        f"""
+        SELECT DATE(`consumption_date`) AS `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
+        FROM `item_histories`
+        {where}
+        GROUP BY DATE(`consumption_date`)
+        ORDER BY DATE(`consumption_date`)
+        """,
+        params,
+    )
+    history: list[dict[str, Any]] = []
+    for row in rows:
+        day = _as_python_date(row.get("consumption_date"))
+        if day is None:
+            continue
+        history.append({
+            "consumption_date": day,
+            "actual_sale": row.get("actual_sale"),
+        })
+    return history
 
 
 def list_active_databases() -> list[dict[str, str]]:
@@ -530,7 +629,14 @@ def replace_synced_vendors(vendor_names: list[str], database: str | None = None)
         return {"deleted": deleted, "inserted_or_updated": inserted, "received": len(cleaned)}
 
 
-def list_rows(table_name: str, limit: int, offset: int, database: str | None = None, stock_out: bool = False) -> list[dict[str, Any]]:
+def list_rows(
+    table_name: str,
+    limit: int,
+    offset: int,
+    database: str | None = None,
+    stock_out: bool = False,
+    grid: str | None = "catalog",
+) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, table_name)
         if table_name == 'items':
@@ -539,18 +645,28 @@ def list_rows(table_name: str, limit: int, offset: int, database: str | None = N
             vendor_override_days = _get_vendor_override_days(database)
             join = _item_override_join_sql(vendor_override_days)
             select = f"SELECT {_item_override_select_fields()} FROM items {join}"
+            sql_filter = _sql_filter_for_table(database, table_name)
             if stock_out:
-                query = f"{select} WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
+                where = "WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
+                where = append_sql_filter(where, sql_filter)
+                query = f"{select} {where}"
                 params: tuple = ()
             else:
-                query = f"{select} LIMIT %s OFFSET %s"
+                where = append_sql_filter("", sql_filter)
+                query = f"{select} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
         else:
+            sql_filter = _sql_filter_for_table(database, table_name)
             if stock_out:
-                query = f"SELECT * FROM {quote_ident(table_name)} WHERE stock_level <= 0 OR stock_level IS NULL"
+                where = append_sql_filter(
+                    "WHERE stock_level <= 0 OR stock_level IS NULL",
+                    sql_filter,
+                )
+                query = f"SELECT * FROM {quote_ident(table_name)} {where}"
                 params = ()
             else:
-                query = f"SELECT * FROM {quote_ident(table_name)} LIMIT %s OFFSET %s"
+                where = append_sql_filter("", sql_filter)
+                query = f"SELECT * FROM {quote_ident(table_name)} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(query, params)
@@ -695,31 +811,7 @@ def get_sim_input_data(
             raise ValueError(f"Item not found: {item_id}")
 
         item_number = item.get("item_number") or ""
-        hist_cols = {c.name for c in get_columns(conn, "item_histories")}
-        if "item_id" in hist_cols:
-            history_rows = _get_rows(
-                conn,
-                """
-                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-                FROM `item_histories`
-                WHERE `item_id` = %s
-                GROUP BY `consumption_date`
-                ORDER BY `consumption_date`
-                """,
-                (item_id,),
-            )
-        else:
-            history_rows = _get_rows(
-                conn,
-                """
-                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-                FROM `item_histories`
-                WHERE `item_number` = %s
-                GROUP BY `consumption_date`
-                ORDER BY `consumption_date`
-                """,
-                (item_number,),
-            )
+        history_rows = _fetch_item_history_sales(conn, database, item_id, item_number)
 
         history_dates = [row["consumption_date"] for row in history_rows if row["consumption_date"]]
         series_end = end_day or date.today()
@@ -854,34 +946,14 @@ def get_forecast_input_data(
         raise ValueError("season_length must be at least 1")
 
     with connection(database) as conn:
+        item_number = ""
         hist_cols = {c.name for c in get_columns(conn, "item_histories")}
-        if "item_id" in hist_cols:
-            history_rows = _get_rows(
-                conn,
-                """
-                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-                FROM `item_histories`
-                WHERE `item_id` = %s
-                GROUP BY `consumption_date`
-                ORDER BY `consumption_date`
-                """,
-                (item_id,),
-            )
-        else:
+        if "item_id" not in hist_cols:
             item = _get_single_row(conn, "SELECT `item_number` FROM `items` WHERE `id` = %s", (item_id,))
             if not item:
                 raise ValueError(f"Item not found: {item_id}")
-            history_rows = _get_rows(
-                conn,
-                """
-                SELECT `consumption_date`, SUM(ABS(`qty`)) AS `actual_sale`
-                FROM `item_histories`
-                WHERE `item_number` = %s
-                GROUP BY `consumption_date`
-                ORDER BY `consumption_date`
-                """,
-                (item.get("item_number"),),
-            )
+            item_number = item.get("item_number") or ""
+        history_rows = _fetch_item_history_sales(conn, database, item_id, item_number)
 
         if not history_rows:
             raise ValueError(f"Item not found in item_histories: {item_id}")
@@ -1127,6 +1199,9 @@ def create_order_from_purchase_suggestions(
             placeholders = ",".join(["%s"] * len(scoped_ids))
             scope_sql = f" AND items.id IN ({placeholders})"
             scope_params = tuple(scoped_ids)
+        catalog_filter = _sql_filter_for_table(database, "items")
+        if catalog_filter:
+            scope_sql = f"{scope_sql} AND ({catalog_filter})"
         with conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -1181,18 +1256,33 @@ def create_order_from_purchase_suggestions(
 def list_orders(database: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     with connection(database) as conn:
         _ensure_orders_tables(conn)
+        ensure_table_exists(conn, "items")
+        sql_filter = _sql_filter_for_tables(database, "items", "order_lines")
+        if sql_filter:
+            line_count_sql = f"COUNT(CASE WHEN {sql_filter} THEN order_lines.id END)"
+            total_qty_sql = (
+                "COALESCE(SUM(CASE WHEN "
+                f"{sql_filter} THEN COALESCE(order_lines.qty_override, order_lines.qty_suggested) "
+                "END), 0)"
+            )
+        else:
+            line_count_sql = "COUNT(order_lines.id)"
+            total_qty_sql = (
+                "COALESCE(SUM(COALESCE(order_lines.qty_override, order_lines.qty_suggested)), 0)"
+            )
         return _get_rows(
             conn,
             f"""
             SELECT
                 orders.*,
-                COUNT(order_lines.id) AS line_count,
-                COALESCE(SUM(COALESCE(order_lines.qty_override, order_lines.qty_suggested)), 0) AS total_qty
+                {line_count_sql} AS line_count,
+                {total_qty_sql} AS total_qty
             FROM orders
             LEFT JOIN order_lines
                 ON orders.id = order_lines.order_id
                 AND COALESCE(order_lines.deleted, 0) = 0
                 AND {_POSITIVE_ORDER_QTY_SQL}
+            LEFT JOIN items ON items.id = order_lines.item_id
             GROUP BY orders.id
             ORDER BY COALESCE(orders.created_at, orders.order_date) DESC, orders.id DESC
             LIMIT %s
@@ -1233,6 +1323,11 @@ _ORDER_LINE_EXPLICIT_ITEM_COLS = {
     "purchasing_method",
     "unit_cost",
     "price",
+    # Never alias these from items — they collide with order_lines fields.
+    "qty_override",
+    "qty_suggested",
+    "order_qty_override",
+    "order_qty_suggested",
 }
 
 
@@ -1379,6 +1474,7 @@ def list_order_items(
     offset: int = 0,
     order_lines_only: bool = True,
     stock_out: bool = False,
+    grid: str | None = None,
 ) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, "items")
@@ -1388,17 +1484,24 @@ def list_order_items(
         vendor_override_days = _get_vendor_override_days(database)
         item_fields = _order_line_display_item_fields(conn)
         select_sql = _order_items_select_sql(vendor_override_days, item_fields)
+        sql_filter = (
+            _sql_filter_for_tables(database, "items", "order_lines")
+            if order_lines_only
+            else _sql_filter_for_table(database, "items")
+        )
         if order_lines_only:
+            where_clause = append_sql_filter(
+                "WHERE order_lines.order_id = %s"
+                " AND COALESCE(order_lines.deleted, 0) = 0"
+                f" AND {_POSITIVE_ORDER_QTY_SQL}",
+                sql_filter,
+            )
             query = select_sql.format(
                 from_clause="""
             order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
             LEFT JOIN items ON items.id = order_lines.item_id""",
-                where_clause=(
-                    "WHERE order_lines.order_id = %s"
-                    " AND COALESCE(order_lines.deleted, 0) = 0"
-                    f" AND {_POSITIVE_ORDER_QTY_SQL}"
-                ),
+                where_clause=where_clause,
                 order_clause="ORDER BY order_lines.id",
             )
             params = (order_id, limit, offset)
@@ -1408,6 +1511,7 @@ def list_order_items(
                 if stock_out
                 else ""
             )
+            where_clause = append_sql_filter(f"WHERE 1=1{stock_filter}", sql_filter)
             query = select_sql.format(
                 from_clause="""
             items
@@ -1416,7 +1520,7 @@ def list_order_items(
                 AND order_lines.order_id = %s
                 AND COALESCE(order_lines.deleted, 0) = 0
             LEFT JOIN orders ON orders.id = %s""",
-                where_clause=f"WHERE 1=1{stock_filter}",
+                where_clause=where_clause,
                 order_clause="ORDER BY items.id",
             )
             params = (order_id, order_id, limit, offset)

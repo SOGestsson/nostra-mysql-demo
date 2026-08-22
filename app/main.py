@@ -699,11 +699,15 @@ def list_order_items(
     offset: int = Query(default=0, ge=0),
     order_lines_only: bool = Query(default=True),
     stock_out: bool = Query(default=False),
+    sql_grid: str | None = Query(default=None, alias="sqlGrid"),
     authorization: str = Header(default=""),
 ) -> dict[str, Any]:
     token = authorization.removeprefix("Bearer ").strip()
     try:
         auth_module.verify_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    try:
         rows = db.list_order_items(
             order_id=order_id,
             database=db_name,
@@ -711,11 +715,14 @@ def list_order_items(
             offset=offset,
             order_lines_only=order_lines_only,
             stock_out=stock_out,
+            grid=sql_grid,
         )
         return {"order_id": order_id, "count": len(rows), "rows": rows}
     except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in {1054, 1064, 1066, 1146}:
+            raise HTTPException(status_code=400, detail=f"Ógild SQL-sía: {exc.msg}") from exc
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 
@@ -913,13 +920,25 @@ def list_rows(
     limit: int = Query(default=100, ge=1, le=20000),
     offset: int = Query(default=0, ge=0),
     stock_out: bool = Query(default=False),
+    sql_grid: str | None = Query(default="catalog", alias="sqlGrid"),
 ) -> dict[str, Any]:
     try:
-        rows = db.list_rows(table_name=table_name, limit=limit, offset=offset, database=db_name, stock_out=stock_out)
+        rows = db.list_rows(
+            table_name=table_name,
+            limit=limit,
+            offset=offset,
+            database=db_name,
+            stock_out=stock_out,
+            grid=sql_grid,
+        )
         return {"table": table_name, "count": len(rows), "rows": rows}
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        message = str(exc)
+        status_code = 400 if "SQL filter" in message else 404
+        raise HTTPException(status_code=status_code, detail=message) from exc
     except mysql.connector.Error as exc:
+        if getattr(exc, "errno", None) in {1054, 1064, 1066, 1146}:
+            raise HTTPException(status_code=400, detail=f"Ógild SQL-sía: {exc.msg}") from exc
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 

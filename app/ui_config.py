@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app import db
+from app.sql_filter import migrate_table_sql_filters, normalize_sql_filter
 
 HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 GRID_PAGING_MODES = frozenset({"pages", "scroll"})
@@ -46,6 +47,27 @@ class UsersEditorConfig(BaseModel):
 ColumnEditorConfig = NativeEditorConfig | EnumEditorConfig | LookupEditorConfig | UsersEditorConfig
 
 
+class SavedWhereFilter(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=MAX_WHERE_FILTER_NAME_LEN)
+    expression: str = Field(min_length=1, max_length=MAX_WHERE_EXPRESSION_LEN)
+    enabled: bool = True
+
+    @field_validator("id", "name", "expression", mode="before")
+    @classmethod
+    def _strip_text(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        return str(value).strip()
+
+    @field_validator("name", "expression")
+    @classmethod
+    def _non_empty(cls, value: str) -> str:
+        if not value:
+            raise ValueError("must not be empty")
+        return value
+
+
 class DbUiConfigPayload(BaseModel):
     editableColumns: list[str] = []
     visibleColumns: list[str] = []
@@ -57,6 +79,13 @@ class DbUiConfigPayload(BaseModel):
     catalogTable: str = "items"
     vendorOverrideDays: int = Field(default=30, ge=0, le=3650)
     progressStatusColors: dict[str, str] = Field(default_factory=dict)
+    catalogSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
+    ordersSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
+    optimalPlanSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
+    catalogSqlFilter: str = ""
+    ordersSqlFilter: str = ""
+    optimalPlanSqlFilter: str = ""
+    tableSqlFilters: dict[str, str] = Field(default_factory=dict)
 
 
 def _normalize_hex_color(value: str) -> str:
@@ -158,28 +187,20 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
         if value and value.strip()
     }
     result["progressStatusColors"] = _validate_progress_status_colors(payload.progressStatusColors)
+    result["catalogSharedWhereFilters"] = validate_saved_where_filters(payload.catalogSharedWhereFilters)
+    result["ordersSharedWhereFilters"] = validate_saved_where_filters(payload.ordersSharedWhereFilters)
+    result["optimalPlanSharedWhereFilters"] = validate_saved_where_filters(
+        payload.optimalPlanSharedWhereFilters,
+    )
+    result["catalogSqlFilter"] = normalize_sql_filter(payload.catalogSqlFilter)
+    result["ordersSqlFilter"] = normalize_sql_filter(payload.ordersSqlFilter)
+    result["optimalPlanSqlFilter"] = normalize_sql_filter(payload.optimalPlanSqlFilter)
+    table_filters = migrate_table_sql_filters(result)
+    result["tableSqlFilters"] = table_filters
+    catalog_table = str(result.get("catalogTable") or "items").strip() or "items"
+    result["catalogSqlFilter"] = table_filters.get(catalog_table, "")
+    result["ordersSqlFilter"] = table_filters.get("order_lines", "")
     return result
-
-
-class SavedWhereFilter(BaseModel):
-    id: str = Field(min_length=1, max_length=64)
-    name: str = Field(min_length=1, max_length=MAX_WHERE_FILTER_NAME_LEN)
-    expression: str = Field(min_length=1, max_length=MAX_WHERE_EXPRESSION_LEN)
-    enabled: bool = True
-
-    @field_validator("id", "name", "expression", mode="before")
-    @classmethod
-    def _strip_text(cls, value: Any) -> Any:
-        if value is None:
-            return value
-        return str(value).strip()
-
-    @field_validator("name", "expression")
-    @classmethod
-    def _non_empty(cls, value: str) -> str:
-        if not value:
-            raise ValueError("must not be empty")
-        return value
 
 
 def _new_saved_where_filter_id() -> str:
@@ -197,6 +218,8 @@ def validate_saved_where_filters(raw: Any) -> list[dict[str, Any]]:
     validated: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for item in raw:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
         if not isinstance(item, dict):
             continue
         data = dict(item)
