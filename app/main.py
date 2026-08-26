@@ -310,6 +310,13 @@ def admin_delete_user(user_id: int, authorization: str = Header(default="")) -> 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
+@app.post("/auth/seen")
+def mark_seen(authorization: str = Header(default="")) -> dict:
+    user = require_request_user(authorization)
+    auth_module.touch_last_seen(user["id"])
+    return {"ok": True}
+
+
 @app.post("/auth/login")
 def login(payload: LoginRequest, request: Request) -> dict:
     ip = client_ip(request)

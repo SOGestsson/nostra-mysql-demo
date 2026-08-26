@@ -56,6 +56,12 @@ def ensure_users_table() -> None:
                     "ALTER TABLE users ADD COLUMN is_admin TINYINT(1) NOT NULL DEFAULT 0"
                 )
             cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = 'nostradamus_master' AND table_name = 'users' AND column_name = 'last_seen_at'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("ALTER TABLE users ADD COLUMN last_seen_at DATETIME NULL")
+            cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS db_ui_config (
                     db_name VARCHAR(100) PRIMARY KEY,
@@ -181,10 +187,10 @@ def record_login(
     email = (email or "").strip()
     if not email:
         return
+    resolved_id = user_id
     conn = _master_conn()
     try:
         with conn.cursor() as cursor:
-            resolved_id = user_id
             if resolved_id is None:
                 cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
                 row = cursor.fetchone()
@@ -206,6 +212,38 @@ def record_login(
         conn.commit()
     except Exception:
         logger.exception("failed to record login history")
+        return
+    finally:
+        conn.close()
+    if success and resolved_id:
+        touch_last_seen(resolved_id, force=True)
+
+
+def touch_last_seen(user_id: int, *, force: bool = False) -> None:
+    if not user_id:
+        return
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    conn = _master_conn()
+    try:
+        with conn.cursor() as cursor:
+            if force:
+                cursor.execute(
+                    "UPDATE users SET last_seen_at = %s WHERE id = %s",
+                    (now, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET last_seen_at = %s
+                    WHERE id = %s
+                      AND (last_seen_at IS NULL OR last_seen_at < %s)
+                    """,
+                    (now, user_id, now - timedelta(minutes=5)),
+                )
+        conn.commit()
+    except Exception:
+        logger.exception("failed to update last_seen_at")
     finally:
         conn.close()
 
@@ -266,6 +304,7 @@ def list_users() -> list[dict]:
                     u.database_name,
                     u.is_admin,
                     u.created_at,
+                    u.last_seen_at,
                     (
                         SELECT MAX(h.created_at)
                         FROM login_history h
@@ -284,6 +323,7 @@ def list_users() -> list[dict]:
             "is_admin": bool(row["is_admin"]),
             "created_at": _fmt_dt(row["created_at"]),
             "last_login_at": _fmt_dt(row["last_login_at"]),
+            "last_seen_at": _fmt_dt(row.get("last_seen_at")),
         }
         for row in rows
     ]
