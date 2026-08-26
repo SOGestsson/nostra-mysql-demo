@@ -8,7 +8,8 @@ SSH_USER="siggi"
 #   fagrihvammur   100.117.16.77   consumables frontend :8080, drilling :8081
 # LAN heima: DEPLOY_HOST=192.168.1.50 bash deploy-db-api.sh
 SSH_HOST="${DEPLOY_HOST:-100.108.73.62}"
-SSH_PASS="Superman"
+SSH_PASS="${SSH_PASS:-Superman}"
+JWT_SECRET="${JWT_SECRET:-nostradamus-secret-key}"
 CONTAINER="db-api"
 PORT="8001"
 
@@ -57,11 +58,11 @@ REMOTE_CMD="
     -e MASTER_DB_PORT=4406 \
     -e MASTER_DB_USER=root \
     -e MASTER_DB_PASSWORD=Superman \
-    -e JWT_SECRET=nostradamus-secret-key \
+    -e JWT_SECRET=$JWT_SECRET \
     $OPENCLAW_ENV \
     $LLM_ENV \
     $IMAGE &&
-  HEALTH_URL='http://127.0.0.1:$PORT/tables/items/rows?db=consumables&limit=1' &&
+  HEALTH_URL='http://127.0.0.1:$PORT/health' &&
   ok=0 &&
   for i in \$(seq 1 30); do
     if curl -sf \"\$HEALTH_URL\" >/dev/null; then
@@ -81,4 +82,4 @@ REMOTE_CMD="
 
 SSHPASS="$SSH_PASS" sshpass -e ssh -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "$REMOTE_CMD"
 
-echo "==> Done. db-api: http://$SSH_HOST:$PORT/docs"
+echo "==> Done. db-api: http://$SSH_HOST:$PORT/health"

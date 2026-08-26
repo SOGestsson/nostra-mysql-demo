@@ -17,7 +17,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", _DEFAULT_JWT_SECRET)
 if JWT_SECRET == _DEFAULT_JWT_SECRET:
     logger.warning("JWT_SECRET not set — using insecure default; set JWT_SECRET in production")
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRY_HOURS = 24 * 7  # 1 week
+JWT_EXPIRY_HOURS = 24
 
 
 def _master_conn():
@@ -81,6 +81,8 @@ def ensure_users_table() -> None:
 
 
 def register_user(username: str, email: str, password: str, database_name: str, is_admin: bool = False) -> dict:
+    if len(password or "") < 8:
+        raise ValueError("Password must be at least 8 characters")
     # verify database exists and is active
     db._get_db_config(database_name)
 

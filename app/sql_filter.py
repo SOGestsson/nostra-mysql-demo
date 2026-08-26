@@ -8,10 +8,13 @@ SQL_FILTER_MAX_LEN = 4000
 _SQL_FILTER_FORBIDDEN = re.compile(
     r"""
     (?:--|\#|/\*|\*/|;)
-    | \b(?:UNION|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|
+    | \b(?:UNION|SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|REPLACE|
            GRANT|REVOKE|CALL|PROCEDURE|FUNCTION|TRIGGER|EVENT|EXECUTE|
            INTO|OUTFILE|DUMPFILE|LOAD_FILE|SLEEP|BENCHMARK|
+           FROM|JOIN|GROUP|HAVING|ORDER|
            INFORMATION_SCHEMA|PERFORMANCE_SCHEMA)\b
+    | \b(?:mysql|information_schema|performance_schema|sys|nostradamus_master)\s*\.
+    | `(?:mysql|information_schema|performance_schema|sys|nostradamus_master)`\s*\.
     """,
     re.IGNORECASE | re.VERBOSE,
 )
