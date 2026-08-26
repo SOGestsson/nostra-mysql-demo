@@ -139,8 +139,10 @@ app.add_middleware(
 
 
 @app.post("/auth/register", status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest) -> dict:
+def register(payload: RegisterRequest, authorization: str = Header(default="")) -> dict:
+    token = authorization.removeprefix("Bearer ").strip()
     try:
+        auth_module.require_admin(token)
         user = auth_module.register_user(
             username=payload.username,
             email=payload.email,
@@ -150,7 +152,9 @@ def register(payload: RegisterRequest) -> dict:
         )
         return {"user": user}
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        message = str(exc)
+        status_code = 403 if message in {"Admin access required", "Token expired", "Invalid token"} else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
