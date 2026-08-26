@@ -169,6 +169,16 @@ def admin_list_users(authorization: str = Header(default="")) -> dict:
     return {"users": auth_module.list_users()}
 
 
+@app.get("/admin/users/{user_id}/login-history")
+def admin_login_history(
+    user_id: int,
+    authorization: str = Header(default=""),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    require_request_user(authorization, admin=True)
+    return {"user_id": user_id, "history": auth_module.list_login_history(user_id, limit=limit)}
+
+
 @app.get("/db-users")
 def list_db_users(
     db_name: str = Query(..., alias="db"),
@@ -302,10 +312,26 @@ def admin_delete_user(user_id: int, authorization: str = Header(default="")) -> 
 
 @app.post("/auth/login")
 def login(payload: LoginRequest, request: Request) -> dict:
-    check_login_rate(client_ip(request))
+    ip = client_ip(request)
+    check_login_rate(ip)
+    user_agent = request.headers.get("user-agent") or ""
     try:
-        return auth_module.login_user(email=payload.email, password=payload.password)
+        result = auth_module.login_user(email=payload.email, password=payload.password)
+        auth_module.record_login(
+            email=payload.email,
+            success=True,
+            ip=ip,
+            user_agent=user_agent,
+            user_id=result["user"]["id"],
+        )
+        return result
     except ValueError as exc:
+        auth_module.record_login(
+            email=payload.email,
+            success=False,
+            ip=ip,
+            user_agent=user_agent,
+        )
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
