@@ -82,9 +82,13 @@ class DbUiConfigPayload(BaseModel):
     catalogSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
     ordersSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
     optimalPlanSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
+    forecastsSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
+    roiSharedWhereFilters: list[SavedWhereFilter] = Field(default_factory=list)
     catalogSqlFilter: str = ""
     ordersSqlFilter: str = ""
     optimalPlanSqlFilter: str = ""
+    forecastsSqlFilter: str = ""
+    roiSqlFilter: str = ""
     tableSqlFilters: dict[str, str] = Field(default_factory=dict)
 
 
@@ -192,9 +196,17 @@ def validate_db_ui_config(config: dict[str, Any], database: str) -> dict[str, An
     result["optimalPlanSharedWhereFilters"] = validate_saved_where_filters(
         payload.optimalPlanSharedWhereFilters,
     )
+    result["forecastsSharedWhereFilters"] = validate_saved_where_filters(
+        payload.forecastsSharedWhereFilters,
+    )
+    result["roiSharedWhereFilters"] = validate_saved_where_filters(
+        payload.roiSharedWhereFilters,
+    )
     result["catalogSqlFilter"] = normalize_sql_filter(payload.catalogSqlFilter)
     result["ordersSqlFilter"] = normalize_sql_filter(payload.ordersSqlFilter)
     result["optimalPlanSqlFilter"] = normalize_sql_filter(payload.optimalPlanSqlFilter)
+    result["forecastsSqlFilter"] = normalize_sql_filter(payload.forecastsSqlFilter)
+    result["roiSqlFilter"] = normalize_sql_filter(payload.roiSqlFilter)
     table_filters = migrate_table_sql_filters(result)
     result["tableSqlFilters"] = table_filters
     catalog_table = str(result.get("catalogTable") or "items").strip() or "items"
@@ -307,6 +319,20 @@ USER_DB_CONFIG_FIELDS: dict[str, str] = {
     "optimalPlanShowRowNumbers": "bool",
     "optimalPlanGridPaging": "grid_paging",
     "optimalPlanSavedWhereFilters": "saved_where_filters",
+    "forecastsVisibleColumns": "string_list",
+    "forecastsFilterableColumns": "string_list",
+    "forecastsColumnWidths": "column_widths",
+    "forecastsFrozenColumnCount": "frozen_count",
+    "forecastsShowRowNumbers": "bool",
+    "forecastsGridPaging": "grid_paging",
+    "forecastsSavedWhereFilters": "saved_where_filters",
+    "roiVisibleColumns": "string_list",
+    "roiFilterableColumns": "string_list",
+    "roiColumnWidths": "column_widths",
+    "roiFrozenColumnCount": "frozen_count",
+    "roiShowRowNumbers": "bool",
+    "roiGridPaging": "grid_paging",
+    "roiSavedWhereFilters": "saved_where_filters",
 }
 
 

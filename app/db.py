@@ -12,7 +12,12 @@ from typing import Any, Iterator
 import mysql.connector
 from mysql.connector import MySQLConnection
 
-from app.sql_filter import append_sql_filter, combine_sql_filters, migrate_table_sql_filters
+from app.sql_filter import (
+    append_sql_filter,
+    combine_sql_filters,
+    migrate_table_sql_filters,
+    resolve_sql_filter,
+)
 
 DEFAULT_VENDOR_OVERRIDE_DAYS = 30
 
@@ -88,6 +93,10 @@ def _table_sql_filters(database: str | None) -> dict[str, str]:
 
 _WRAPPED_CONSUMPTION_DATE_RE = re.compile(r"(?i)DATE\s*\(\s*`?consumption_date`?\s*\)")
 _BARE_CONSUMPTION_DATE_RE = re.compile(r"(?i)(?<![\w.])`?consumption_date`?(?![\w])")
+_GRID_PAGE_SQL_KEYS = {
+    "forecasts": ("forecastsSqlFilter", "forecastsSharedWhereFilters"),
+    "roi": ("roiSqlFilter", "roiSharedWhereFilters"),
+}
 
 
 def _wrap_item_histories_date_filter(expression: str) -> str:
@@ -97,13 +106,23 @@ def _wrap_item_histories_date_filter(expression: str) -> str:
     return _BARE_CONSUMPTION_DATE_RE.sub("DATE(`consumption_date`)", text)
 
 
-def _sql_filter_for_table(database: str | None, table_name: str | None) -> str:
+def _sql_filter_for_table(
+    database: str | None,
+    table_name: str | None,
+    grid: str | None = None,
+) -> str:
     table = str(table_name or "").strip()
     if not table:
         return ""
-    expression = _table_sql_filters(database).get(table, "")
+    config = _get_ui_config(database)
+    expression = migrate_table_sql_filters(config).get(table, "")
     if table == "item_histories":
-        return _wrap_item_histories_date_filter(expression)
+        expression = _wrap_item_histories_date_filter(expression)
+    grid_keys = _GRID_PAGE_SQL_KEYS.get((grid or "").strip())
+    catalog_table = str(config.get("catalogTable") or "items").strip() or "items"
+    if grid_keys and table in {catalog_table, "items"}:
+        extra = resolve_sql_filter(config, *grid_keys)
+        expression = combine_sql_filters(expression, extra)
     return expression
 
 
@@ -639,16 +658,18 @@ def list_rows(
 ) -> list[dict[str, Any]]:
     with connection(database) as conn:
         ensure_table_exists(conn, table_name)
-        if table_name == 'items':
+        sql_filter = _sql_filter_for_table(database, table_name, grid)
+        if table_name == "items":
             _ensure_vendor_overrides_table(conn)
             _ensure_purchasing_method_overrides_table(conn)
             vendor_override_days = _get_vendor_override_days(database)
             join = _item_override_join_sql(vendor_override_days)
             select = f"SELECT {_item_override_select_fields()} FROM items {join}"
-            sql_filter = _sql_filter_for_table(database, table_name)
             if stock_out:
-                where = "WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
-                where = append_sql_filter(where, sql_filter)
+                where = append_sql_filter(
+                    "WHERE items.stock_level <= 0 OR items.stock_level IS NULL",
+                    sql_filter,
+                )
                 query = f"{select} {where}"
                 params: tuple = ()
             else:
@@ -656,7 +677,6 @@ def list_rows(
                 query = f"{select} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
         else:
-            sql_filter = _sql_filter_for_table(database, table_name)
             if stock_out:
                 where = append_sql_filter(
                     "WHERE stock_level <= 0 OR stock_level IS NULL",
@@ -668,9 +688,14 @@ def list_rows(
                 where = append_sql_filter("", sql_filter)
                 query = f"SELECT * FROM {quote_ident(table_name)} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
-        with conn.cursor(dictionary=True) as cursor:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
+        try:
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+        except mysql.connector.Error as exc:
+            if sql_filter:
+                raise ValueError(f"SQL filter failed: {exc.msg}") from exc
+            raise
         return [normalize_row(row) for row in rows]
 
 
@@ -929,6 +954,93 @@ def get_sim_input_data(
         }
 
 
+def _forecast_hist_freq_kind(freq: str) -> str:
+    f = (freq or "D").strip().upper()
+    if f in ("M", "MS", "ME"):
+        return "M"
+    if f.startswith("W"):
+        return "W"
+    if f in ("Q", "QS", "QE"):
+        return "Q"
+    if f in ("Y", "A", "YS", "YE"):
+        return "Y"
+    return "D"
+
+
+def _forecast_period_start(d: date, freq: str) -> date:
+    kind = _forecast_hist_freq_kind(freq)
+    if kind == "M":
+        return date(d.year, d.month, 1)
+    if kind == "Q":
+        month = ((d.month - 1) // 3) * 3 + 1
+        return date(d.year, month, 1)
+    if kind == "Y":
+        return date(d.year, 1, 1)
+    if kind == "W":
+        return d - timedelta(days=d.weekday())
+    return d
+
+
+def _forecast_next_period(d: date, freq: str) -> date:
+    kind = _forecast_hist_freq_kind(freq)
+    if kind == "M":
+        year, month = (d.year + 1, 1) if d.month == 12 else (d.year, d.month + 1)
+        return date(year, month, 1)
+    if kind == "Q":
+        month = d.month + 3
+        year = d.year
+        if month > 12:
+            month -= 12
+            year += 1
+        return date(year, month, 1)
+    if kind == "Y":
+        return date(d.year + 1, 1, 1)
+    if kind == "W":
+        return d + timedelta(days=7)
+    return d + timedelta(days=1)
+
+
+def _build_forecast_sim_input_his(
+    item_id: int,
+    history_rows: list[dict[str, Any]],
+    series_start: date,
+    series_end: date,
+    freq: str,
+) -> list[dict[str, Any]]:
+    """Bucket history to the requested forecast frequency (month-start for M/MS/ME)."""
+    history_by_day: dict[date, float] = {}
+    for row in history_rows:
+        day = _coerce_sql_date(row.get("consumption_date"))
+        if day is None:
+            continue
+        qty = float(row.get("actual_sale") or 0)
+        history_by_day[day] = history_by_day.get(day, 0.0) + qty
+
+    history_by_bucket: dict[date, float] = {}
+    for day, qty in history_by_day.items():
+        if day < series_start or day > series_end:
+            continue
+        bucket = _forecast_period_start(day, freq)
+        history_by_bucket[bucket] = history_by_bucket.get(bucket, 0.0) + qty
+
+    sim_input_his: list[dict[str, Any]] = []
+    current = _forecast_period_start(series_start, freq)
+    last = _forecast_period_start(series_end, freq)
+    while current <= last:
+        sim_input_his.append(
+            {
+                "item_id": item_id,
+                "actual_sale": history_by_bucket.get(current, 0.0),
+                "day": current.isoformat(),
+            }
+        )
+        nxt = _forecast_next_period(current, freq)
+        if nxt <= current:
+            break
+        current = nxt
+    return sim_input_his
+
+
 def get_forecast_input_data(
     item_id: int,
     forecast_periods: int = 30,
@@ -959,34 +1071,20 @@ def get_forecast_input_data(
             raise ValueError(f"Item not found in item_histories: {item_id}")
 
         history_dates = [row["consumption_date"] for row in history_rows if row["consumption_date"]]
-        first_history_day = min(history_dates) if history_dates else None
-        last_history_day = max(history_dates) if history_dates else None
+        first_history_day = _coerce_sql_date(min(history_dates)) if history_dates else None
+        last_history_day = _coerce_sql_date(max(history_dates)) if history_dates else None
 
-        series_start = start_day or first_history_day
-        series_end = end_day or last_history_day
+        series_start = _coerce_sql_date(start_day) or first_history_day
+        series_end = _coerce_sql_date(end_day) or last_history_day
 
         if not series_start or not series_end:
             raise ValueError(f"Item history is missing valid consumption_date values: {item_id}")
         if series_end < series_start:
             raise ValueError("end_day must be on or after start_day")
 
-        history_by_day = {
-            row["consumption_date"]: int(float(row["actual_sale"] or 0))
-            for row in history_rows
-            if row["consumption_date"] is not None
-        }
-
-        sim_input_his: list[dict[str, Any]] = []
-        current_day = series_start
-        while current_day <= series_end:
-            sim_input_his.append(
-                {
-                    "item_id": item_id,
-                    "actual_sale": history_by_day.get(current_day, 0),
-                    "day": current_day.isoformat(),
-                }
-            )
-            current_day += timedelta(days=1)
+        sim_input_his = _build_forecast_sim_input_his(
+            item_id, history_rows, series_start, series_end, freq
+        )
 
         return {
             "sim_input_his": sim_input_his,
@@ -1524,7 +1622,12 @@ def list_order_items(
                 order_clause="ORDER BY items.id",
             )
             params = (order_id, order_id, limit, offset)
-        return _get_rows(conn, query, params)
+        try:
+            return _get_rows(conn, query, params)
+        except mysql.connector.Error as exc:
+            if sql_filter:
+                raise ValueError(f"SQL filter failed: {exc.msg}") from exc
+            raise
 
 
 def _normalize_item_number(item_number: str | None) -> str:
@@ -2300,6 +2403,297 @@ def get_forecast_result(
             """,
             (item_id, limit),
         )
+
+
+STOCK_HISTORY_TABLE = "stock_history"
+ROI_RESULT_TABLE = "roi_result"
+_ROI_ITEM_COLUMNS = (
+    "id",
+    "del_time",
+    "buy_freq",
+    "stock_level",
+    "service_level",
+    "unit_cost",
+    "price",
+    "moq",
+    "order_multiple",
+    "safety_stock",
+)
+_ROI_RESULT_COLUMNS = (
+    "item_id",
+    "method",
+    "model_used",
+    "forecast_freq",
+    "service_level",
+    "ss_source",
+    "ss_override",
+    "unit_cost",
+    "del_time",
+    "buy_freq",
+    "moq",
+    "order_multiple",
+    "cover_days",
+    "order_period_days",
+    "forecast_lead_qty",
+    "forecast_order_qty",
+    "order_qty",
+    "cycle_stock",
+    "safety_stock_forecast",
+    "safety_stock_used",
+    "expected_stock",
+    "expected_value",
+    "current_stock",
+    "current_value",
+    "avg_stock_3m",
+    "avg_stock_6m",
+    "avg_stock_12m",
+    "avg_value_3m",
+    "avg_value_6m",
+    "avg_value_12m",
+    "delta_qty_vs_current",
+    "delta_value_vs_current",
+)
+
+
+def _ensure_stock_history_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quote_ident(STOCK_HISTORY_TABLE)} (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                item_id INT NOT NULL,
+                stock_date DATE NOT NULL,
+                stock_qty DECIMAL(18, 4) NOT NULL,
+                UNIQUE KEY uq_stock_history_item_date (item_id, stock_date),
+                KEY idx_stock_history_item (item_id)
+            )
+            """
+        )
+    conn.commit()
+
+
+def _ensure_roi_result_table(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {quote_ident(ROI_RESULT_TABLE)} (
+                id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                item_id INT NOT NULL,
+                method VARCHAR(32) NOT NULL DEFAULT 'point_estimate',
+                run_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                model_used VARCHAR(64) NULL,
+                forecast_freq VARCHAR(8) NULL,
+                service_level DECIMAL(8, 4) NULL,
+                ss_source VARCHAR(16) NULL,
+                ss_override DECIMAL(18, 4) NULL,
+                unit_cost DECIMAL(18, 4) NULL,
+                del_time DECIMAL(18, 4) NULL,
+                buy_freq DECIMAL(18, 4) NULL,
+                moq DECIMAL(18, 4) NULL,
+                order_multiple DECIMAL(18, 4) NULL,
+                cover_days DECIMAL(18, 4) NULL,
+                order_period_days DECIMAL(18, 4) NULL,
+                forecast_lead_qty DECIMAL(18, 4) NULL,
+                forecast_order_qty DECIMAL(18, 4) NULL,
+                order_qty DECIMAL(18, 4) NULL,
+                cycle_stock DECIMAL(18, 4) NULL,
+                safety_stock_forecast DECIMAL(18, 4) NULL,
+                safety_stock_used DECIMAL(18, 4) NULL,
+                expected_stock DECIMAL(18, 4) NULL,
+                expected_value DECIMAL(18, 4) NULL,
+                current_stock DECIMAL(18, 4) NULL,
+                current_value DECIMAL(18, 4) NULL,
+                avg_stock_3m DECIMAL(18, 4) NULL,
+                avg_stock_6m DECIMAL(18, 4) NULL,
+                avg_stock_12m DECIMAL(18, 4) NULL,
+                avg_value_3m DECIMAL(18, 4) NULL,
+                avg_value_6m DECIMAL(18, 4) NULL,
+                avg_value_12m DECIMAL(18, 4) NULL,
+                delta_qty_vs_current DECIMAL(18, 4) NULL,
+                delta_value_vs_current DECIMAL(18, 4) NULL,
+                UNIQUE KEY uq_roi_item (item_id),
+                KEY idx_roi_item (item_id)
+            )
+            """
+        )
+    conn.commit()
+
+
+def get_roi_item(item_id: int, database: str | None = None) -> dict[str, Any]:
+    with connection(database) as conn:
+        item_cols = {column.name for column in get_columns(conn, "items")}
+        select_cols = [name for name in _ROI_ITEM_COLUMNS if name in item_cols]
+        if "id" not in select_cols:
+            raise ValueError(f"Item not found: {item_id}")
+        quoted = ", ".join(quote_ident(name) for name in select_cols)
+        row = _get_single_row(
+            conn,
+            f"SELECT {quoted} FROM items WHERE id = %s",
+            (item_id,),
+        )
+        if not row:
+            raise ValueError(f"Item not found: {item_id}")
+        return row
+
+
+def get_stock_history_averages(item_id: int, database: str | None = None) -> dict[str, float | None]:
+    with connection(database) as conn:
+        _ensure_stock_history_table(conn)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT
+                AVG(CASE WHEN stock_date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH) THEN stock_qty END) AS avg_stock_3m,
+                AVG(CASE WHEN stock_date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH) THEN stock_qty END) AS avg_stock_6m,
+                AVG(CASE WHEN stock_date >= DATE_SUB(CURDATE(), INTERVAL 12 MONTH) THEN stock_qty END) AS avg_stock_12m
+            FROM {quote_ident(STOCK_HISTORY_TABLE)}
+            WHERE item_id = %s
+            """,
+            (item_id,),
+        )
+        return {
+            "avg_stock_3m": None if not row else row.get("avg_stock_3m"),
+            "avg_stock_6m": None if not row else row.get("avg_stock_6m"),
+            "avg_stock_12m": None if not row else row.get("avg_stock_12m"),
+        }
+
+
+def get_stock_history(
+    item_id: int,
+    database: str | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    with connection(database) as conn:
+        _ensure_stock_history_table(conn)
+        return _get_rows(
+            conn,
+            f"""
+            SELECT item_id, stock_date, stock_qty
+            FROM {quote_ident(STOCK_HISTORY_TABLE)}
+            WHERE item_id = %s
+            ORDER BY stock_date
+            LIMIT %s
+            """,
+            (item_id, limit),
+        )
+
+
+def upsert_roi_result(row: dict[str, Any], database: str | None = None) -> int:
+    if not row or row.get("item_id") is None:
+        return 0
+    prepared = {key: row.get(key) for key in _ROI_RESULT_COLUMNS}
+    prepared["item_id"] = int(row["item_id"])
+    assignments = ", ".join(
+        f"{quote_ident(key)} = VALUES({quote_ident(key)})"
+        for key in _ROI_RESULT_COLUMNS
+        if key != "item_id"
+    )
+    columns_sql = ", ".join(quote_ident(key) for key in _ROI_RESULT_COLUMNS)
+    placeholders = ", ".join(f"%({key})s" for key in _ROI_RESULT_COLUMNS)
+    with connection(database) as conn:
+        _ensure_roi_result_table(conn)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {quote_ident(ROI_RESULT_TABLE)}
+                    ({columns_sql})
+                VALUES
+                    ({placeholders})
+                ON DUPLICATE KEY UPDATE
+                    {assignments},
+                    run_at = CURRENT_TIMESTAMP
+                """,
+                prepared,
+            )
+        conn.commit()
+        return 1
+
+
+def get_roi_result(item_id: int, database: str | None = None) -> dict[str, Any] | None:
+    with connection(database) as conn:
+        _ensure_roi_result_table(conn)
+        return _get_single_row(
+            conn,
+            f"""
+            SELECT {", ".join(quote_ident(key) for key in _ROI_RESULT_COLUMNS)}, run_at
+            FROM {quote_ident(ROI_RESULT_TABLE)}
+            WHERE item_id = %s
+            """,
+            (item_id,),
+        )
+
+
+def get_roi_results(item_ids: list[int], database: str | None = None) -> list[dict[str, Any]]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for raw in item_ids or []:
+        try:
+            item_id = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        ids.append(item_id)
+    if not ids:
+        return []
+    columns = ", ".join(quote_ident(key) for key in _ROI_RESULT_COLUMNS)
+    rows: list[dict[str, Any]] = []
+    chunk = 500
+    with connection(database) as conn:
+        _ensure_roi_result_table(conn)
+        for start in range(0, len(ids), chunk):
+            part = ids[start : start + chunk]
+            placeholders = ", ".join(["%s"] * len(part))
+            rows.extend(
+                _get_rows(
+                    conn,
+                    f"""
+                    SELECT {columns}, run_at
+                    FROM {quote_ident(ROI_RESULT_TABLE)}
+                    WHERE item_id IN ({placeholders})
+                    """,
+                    tuple(part),
+                )
+            )
+    return rows
+
+
+def roi_overview(item_ids: list[int], database: str | None = None) -> dict[str, Any]:
+    from app import roi as roi_module
+
+    rows = get_roi_results(item_ids, database=database)
+    return {
+        "count": len(rows),
+        "summary": roi_module.summarize_results(rows, item_ids),
+    }
+
+
+def run_roi_point_estimate(
+    item_id: int,
+    database: str | None = None,
+    *,
+    service_level: float = 0.95,
+    use_item_service_level: bool = False,
+    ss_source: str = "forecast",
+    persist: bool = True,
+) -> dict[str, Any]:
+    from app import roi as roi_module
+
+    item = get_roi_item(item_id, database=database)
+    forecast_rows = get_forecast_result(item_id, database=database)
+    stock_avgs = get_stock_history_averages(item_id, database=database)
+    result = roi_module.point_estimate(
+        item,
+        forecast_rows,
+        stock_avgs,
+        service_level=service_level,
+        use_item_service_level=use_item_service_level,
+        ss_source=ss_source,
+    )
+    saved = upsert_roi_result(result, database=database) if persist else 0
+    result["saved"] = saved
+    return result
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:

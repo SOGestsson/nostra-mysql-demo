@@ -119,6 +119,20 @@ class UserDbConfigPayload(BaseModel):
     optimalPlanShowRowNumbers: bool | None = None
     optimalPlanGridPaging: str | None = None
     optimalPlanSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
+    forecastsVisibleColumns: list[str] | None = None
+    forecastsFilterableColumns: list[str] | None = None
+    forecastsColumnWidths: dict[str, int] | None = None
+    forecastsFrozenColumnCount: int | None = None
+    forecastsShowRowNumbers: bool | None = None
+    forecastsGridPaging: str | None = None
+    forecastsSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
+    roiVisibleColumns: list[str] | None = None
+    roiFilterableColumns: list[str] | None = None
+    roiColumnWidths: dict[str, int] | None = None
+    roiFrozenColumnCount: int | None = None
+    roiShowRowNumbers: bool | None = None
+    roiGridPaging: str | None = None
+    roiSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
 
 
 class ProgressStatusColorsPayload(BaseModel):
@@ -130,6 +144,10 @@ class ManualVendorPayload(BaseModel):
 
 
 class ForecastBatchPayload(BaseModel):
+    item_ids: list[int]
+
+
+class RoiBatchPayload(BaseModel):
     item_ids: list[int]
 
 
@@ -226,27 +244,11 @@ def get_user_db_config(db_name: str, authorization: str = Header(default="")) ->
         )
         merged = {
             **admin_config,
-            **({"visibleColumns": user_config["visibleColumns"]} if "visibleColumns" in user_config else {}),
-            **({"filterableColumns": user_config["filterableColumns"]} if "filterableColumns" in user_config else {}),
-            **({"ordersVisibleColumns": user_config["ordersVisibleColumns"]} if "ordersVisibleColumns" in user_config else {}),
-            **({"ordersFilterableColumns": user_config["ordersFilterableColumns"]} if "ordersFilterableColumns" in user_config else {}),
-            **({"columnWidths": user_config["columnWidths"]} if "columnWidths" in user_config else {}),
-            **({"ordersColumnWidths": user_config["ordersColumnWidths"]} if "ordersColumnWidths" in user_config else {}),
-            **({"catalogFrozenColumnCount": user_config["catalogFrozenColumnCount"]} if "catalogFrozenColumnCount" in user_config else {}),
-            **({"ordersFrozenColumnCount": user_config["ordersFrozenColumnCount"]} if "ordersFrozenColumnCount" in user_config else {}),
-            **({"catalogShowRowNumbers": user_config["catalogShowRowNumbers"]} if "catalogShowRowNumbers" in user_config else {}),
-            **({"ordersShowRowNumbers": user_config["ordersShowRowNumbers"]} if "ordersShowRowNumbers" in user_config else {}),
-            **({"catalogSavedWhereFilters": user_config["catalogSavedWhereFilters"]} if "catalogSavedWhereFilters" in user_config else {}),
-            **({"ordersSavedWhereFilters": user_config["ordersSavedWhereFilters"]} if "ordersSavedWhereFilters" in user_config else {}),
-            **({"catalogGridPaging": user_config["catalogGridPaging"]} if "catalogGridPaging" in user_config else {}),
-            **({"ordersGridPaging": user_config["ordersGridPaging"]} if "ordersGridPaging" in user_config else {}),
-            **({"optimalPlanVisibleColumns": user_config["optimalPlanVisibleColumns"]} if "optimalPlanVisibleColumns" in user_config else {}),
-            **({"optimalPlanFilterableColumns": user_config["optimalPlanFilterableColumns"]} if "optimalPlanFilterableColumns" in user_config else {}),
-            **({"optimalPlanColumnWidths": user_config["optimalPlanColumnWidths"]} if "optimalPlanColumnWidths" in user_config else {}),
-            **({"optimalPlanFrozenColumnCount": user_config["optimalPlanFrozenColumnCount"]} if "optimalPlanFrozenColumnCount" in user_config else {}),
-            **({"optimalPlanShowRowNumbers": user_config["optimalPlanShowRowNumbers"]} if "optimalPlanShowRowNumbers" in user_config else {}),
-            **({"optimalPlanGridPaging": user_config["optimalPlanGridPaging"]} if "optimalPlanGridPaging" in user_config else {}),
-            **({"optimalPlanSavedWhereFilters": user_config["optimalPlanSavedWhereFilters"]} if "optimalPlanSavedWhereFilters" in user_config else {}),
+            **{
+                key: user_config[key]
+                for key in ui_config_module.USER_DB_CONFIG_FIELDS
+                if key in user_config
+            },
         }
         return {"db_name": db_name, "config": merged, "admin_config": admin_config}
     except ValueError as exc:
@@ -1036,6 +1038,153 @@ def get_forecast(
     try:
         rows = db.get_forecast_result(item_id=item_id, database=db_name, limit=limit)
         return {"item_id": item_id, "count": len(rows), "rows": rows}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+def _roi_run_params(
+    service_level: float,
+    use_item_service_level: bool,
+    ss_source: str,
+) -> dict[str, Any]:
+    source = (ss_source or "forecast").strip().lower()
+    if source not in {"forecast", "override"}:
+        raise ValueError("ss_source must be 'forecast' or 'override'")
+    if not 0 < service_level < 1:
+        raise ValueError("service_level must be between 0 and 1")
+    return {
+        "service_level": service_level,
+        "use_item_service_level": use_item_service_level,
+        "ss_source": source,
+    }
+
+
+@app.post("/roi/run/{item_id}")
+def run_roi(
+    item_id: int,
+    db_name: str = Query(..., alias="db"),
+    service_level: float = Query(default=0.95, gt=0, lt=1),
+    use_item_service_level: bool = Query(default=False),
+    ss_source: str = Query(default="forecast"),
+    persist: bool = Query(default=True),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        params = _roi_run_params(service_level, use_item_service_level, ss_source)
+        row = db.run_roi_point_estimate(
+            item_id,
+            database=db_name,
+            persist=persist,
+            **params,
+        )
+        return {"item_id": item_id, "saved": row.get("saved") or 0, "row": row}
+    except ValueError as exc:
+        message = str(exc)
+        if message in ("Token expired", "Invalid token"):
+            status_code = 401
+        elif message.startswith("Item not found"):
+            status_code = 404
+        else:
+            status_code = 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/roi/run-batch")
+def run_roi_batch(
+    payload: RoiBatchPayload,
+    db_name: str = Query(..., alias="db"),
+    service_level: float = Query(default=0.95, gt=0, lt=1),
+    use_item_service_level: bool = Query(default=False),
+    ss_source: str = Query(default="forecast"),
+    persist: bool = Query(default=True),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        params = _roi_run_params(service_level, use_item_service_level, ss_source)
+    except ValueError as exc:
+        message = str(exc)
+        status_code = 401 if message in ("Token expired", "Invalid token") else 400
+        raise HTTPException(status_code=status_code, detail=message) from exc
+
+    if not payload.item_ids:
+        raise HTTPException(status_code=400, detail="item_ids must not be empty")
+
+    saved = 0
+    rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for item_id in payload.item_ids:
+        try:
+            row = db.run_roi_point_estimate(
+                item_id,
+                database=db_name,
+                persist=persist,
+                **params,
+            )
+            saved += int(row.get("saved") or 0)
+            rows.append(row)
+        except ValueError as exc:
+            skipped.append({"item_id": item_id, "error": str(exc)})
+        except Exception as exc:
+            failed.append({"item_id": item_id, "error": str(exc)})
+
+    return {
+        "saved": saved,
+        "items": len(rows),
+        "skipped": skipped,
+        "failed": failed,
+    }
+
+
+@app.post("/roi/overview")
+def roi_overview(
+    payload: RoiBatchPayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        return db.roi_overview(payload.item_ids, database=db_name)
+    except ValueError as exc:
+        status_code = 401 if str(exc) in ("Token expired", "Invalid token") else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/roi/{item_id}/stock-history")
+def get_roi_stock_history(
+    item_id: int,
+    db_name: str = Query(..., alias="db"),
+    limit: int = Query(default=1000, ge=1, le=20000),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        rows = db.get_stock_history(item_id=item_id, database=db_name, limit=limit)
+        return {"item_id": item_id, "count": len(rows), "rows": rows}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.get("/roi/{item_id}")
+def get_roi(
+    item_id: int,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        row = db.get_roi_result(item_id=item_id, database=db_name)
+        return {"item_id": item_id, "row": row}
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
