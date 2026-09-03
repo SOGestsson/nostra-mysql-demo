@@ -387,7 +387,7 @@ def _item_override_select_fields() -> str:
 def get_item_with_overrides(item_id: int, database: str | None = None) -> dict[str, Any] | None:
     with connection(database) as conn:
         row = _fetch_item_with_overrides_conn(conn, item_id, database)
-        return normalize_row(row) if row else None
+        return _normalize_item_row(row)
 
 
 def _fetch_item_with_overrides_conn(
@@ -646,15 +646,19 @@ def list_rows(
             join = _item_override_join_sql(vendor_override_days)
             select = f"SELECT {_item_override_select_fields()} FROM items {join}"
             sql_filter = _sql_filter_for_table(database, table_name)
+            item_cols = {column.name for column in get_columns(conn, "items")}
             if stock_out:
-                where = "WHERE items.stock_level <= 0 OR items.stock_level IS NULL"
-                where = append_sql_filter(where, sql_filter)
+                where = append_sql_filter(_sql_stock_out_predicate(item_cols), sql_filter)
                 query = f"{select} {where}"
                 params: tuple = ()
             else:
                 where = append_sql_filter("", sql_filter)
                 query = f"{select} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+            return [_normalize_item_row(row) for row in rows]
         else:
             sql_filter = _sql_filter_for_table(database, table_name)
             if stock_out:
@@ -809,6 +813,7 @@ def get_sim_input_data(
         item = _fetch_item_with_overrides_conn(conn, item_id, database)
         if not item:
             raise ValueError(f"Item not found: {item_id}")
+        _resolve_item_stock_row(item)
 
         item_number = item.get("item_number") or ""
         history_rows = _fetch_item_history_sales(conn, database, item_id, item_number)
@@ -1303,6 +1308,32 @@ def _sql_item_col(item_cols: set[str], name: str, alias: str | None = None) -> s
     return f"NULL AS {out_sql}"
 
 
+def _sql_effective_stock_level(item_cols: set[str]) -> str:
+    """Prefer live_avail_qty (ERP stock) over legacy stock_level when present."""
+    live = "live_avail_qty"
+    stock = "stock_level"
+    if live in item_cols:
+        if stock in item_cols:
+            return (
+                f"COALESCE(items.{_sql_quote_identifier(live)}, "
+                f"items.{_sql_quote_identifier(stock)}) AS stock_level"
+            )
+        return f"items.{_sql_quote_identifier(live)} AS stock_level"
+    return _sql_item_col(item_cols, stock)
+
+
+def _sql_stock_out_predicate(item_cols: set[str], table_prefix: str = "items") -> str:
+    live = f"{table_prefix}.{_sql_quote_identifier('live_avail_qty')}"
+    stock = f"{table_prefix}.{_sql_quote_identifier('stock_level')}"
+    if "live_avail_qty" in item_cols:
+        parts = [live]
+        if "stock_level" in item_cols:
+            parts.append(stock)
+        coalesce = f"COALESCE({', '.join(parts)}, 0)"
+        return f"WHERE {coalesce} <= 0"
+    return f"WHERE {stock} <= 0 OR {stock} IS NULL"
+
+
 _ORDER_LINE_EXPLICIT_ITEM_COLS = {
     "id",
     "item_number",
@@ -1401,7 +1432,7 @@ def _order_line_display_item_fields(conn: MySQLConnection) -> str:
         id_sql,
         item_number_sql,
         description_sql,
-        _sql_item_col(item_cols, "stock_level"),
+        _sql_effective_stock_level(item_cols),
         _sql_item_col(item_cols, "qty_on_order"),
         _sql_item_col(item_cols, "purchase_suggestion"),
         _sql_item_col(item_cols, "buy_freq"),
@@ -1506,11 +1537,10 @@ def list_order_items(
             )
             params = (order_id, limit, offset)
         else:
-            stock_filter = (
-                " AND (items.stock_level <= 0 OR items.stock_level IS NULL)"
-                if stock_out
-                else ""
-            )
+            item_cols = {column.name for column in get_columns(conn, "items")}
+            stock_filter = ""
+            if stock_out:
+                stock_filter = " AND " + _sql_stock_out_predicate(item_cols).removeprefix("WHERE ")
             where_clause = append_sql_filter(f"WHERE 1=1{stock_filter}", sql_filter)
             query = select_sql.format(
                 from_clause="""
@@ -1524,7 +1554,7 @@ def list_order_items(
                 order_clause="ORDER BY items.id",
             )
             params = (order_id, order_id, limit, offset)
-        return _get_rows(conn, query, params)
+        return [_normalize_item_row(row) for row in _get_rows(conn, query, params)]
 
 
 def _normalize_item_number(item_number: str | None) -> str:
@@ -1553,7 +1583,7 @@ def get_item_by_item_number(item_number: str, database: str | None = None) -> di
             ),
             (pn,),
         )
-        return normalize_row(row) if row else None
+        return _normalize_item_row(row)
 
 
 def _fetch_order_item_row(
@@ -1606,7 +1636,7 @@ def _fetch_order_item_row(
             LIMIT 1
             """
     row = _get_single_row(conn, query, (order_id, order_line_id))
-    return normalize_row(row) if row else None
+    return _normalize_item_row(row)
 
 
 def add_order_line(
@@ -2169,7 +2199,12 @@ def get_sim_optimal_plan_timeseries(
         return [normalize_row(row) for row in rows]
 
 
-def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
+def upsert_sim_result(
+    rows: list[dict[str, Any]],
+    database: str | None = None,
+    *,
+    refresh_optimal_plan: bool = True,
+) -> int:
     if not rows:
         return 0
 
@@ -2197,13 +2232,30 @@ def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -
                 """,
                 rows,
             )
-        dates_after = {
-            d
-            for d in (_coerce_sql_date(row.get("sim_date")) for row in rows)
-            if d is not None
-        }
-        refresh_sim_optimal_plan_daily(conn, dates=list(dates_before | dates_after))
+        if refresh_optimal_plan:
+            dates_after = {
+                d
+                for d in (_coerce_sql_date(row.get("sim_date")) for row in rows)
+                if d is not None
+            }
+            refresh_sim_optimal_plan_daily(conn, dates=list(dates_before | dates_after))
         return len(rows)
+
+
+def _resolve_item_stock_row(row: dict[str, Any]) -> dict[str, Any]:
+    """When live_avail_qty exists, treat it as canonical stock in stock_level."""
+    if not row or "live_avail_qty" not in row:
+        return row
+    live = row.get("live_avail_qty")
+    if live is not None:
+        row["stock_level"] = live
+    return row
+
+
+def _normalize_item_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    return _resolve_item_stock_row(normalize_row(row))
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
