@@ -23,8 +23,8 @@ CREATE OR REPLACE VIEW v_sim_optimal_plan_detail AS
 SELECT
     sr.item_id AS item_id,
     sr.sim_date AS dags,
-    (COALESCE(sr.inv, 0) * COALESCE(NULLIF(i.unit_cost, 0), NULLIF(i.price, 0), 0)) AS inv_value,
-    (COALESCE(sr.inv, 0) * COALESCE(NULLIF(i.unit_cost, 0), NULLIF(i.price, 0), 0) * (0.18 / 365)) AS inventory_cost,
+    (COALESCE(i.price, 0) * COALESCE(i.stock_level, 0)) AS inv_value,
+    (COALESCE(i.price, 0) * COALESCE(i.stock_level, 0) * (0.18 / 365)) AS inventory_cost,
     CASE
         WHEN COALESCE(sr.deliveries, 0) > 0 THEN 90.0
         ELSE 0.0

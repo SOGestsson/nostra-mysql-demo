@@ -628,7 +628,12 @@ def sim_optimal_plan_timeseries(
             database=db_name,
             item_ids=payload.item_ids,
         )
-        return {"series": series}
+        summary = db.get_sim_optimal_plan_summary(
+            database=db_name,
+            item_ids=payload.item_ids,
+            series=series,
+        )
+        return {"series": series, "summary": summary}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except mysql.connector.Error as extra:

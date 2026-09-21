@@ -1954,6 +1954,31 @@ def _items_unit_cost_expr(conn: MySQLConnection, alias: str = "i") -> str:
     return f"COALESCE({parts[0]}, {parts[1]}, 0)"
 
 
+def _items_stock_value_expr(conn: MySQLConnection, alias: str = "i") -> str:
+    """Rio stock_value when present, else stock_level × unit cost."""
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    if "stock_value" in item_cols:
+        return f"COALESCE({alias}.{_sql_quote_identifier('stock_value')}, 0)"
+    unit_cost = _items_unit_cost_expr(conn, alias)
+    if "live_avail_qty" in item_cols:
+        qty = f"COALESCE({alias}.{_sql_quote_identifier('live_avail_qty')}, {alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    elif "stock_level" in item_cols:
+        qty = f"COALESCE({alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    else:
+        qty = "0"
+    return f"({qty} * ({unit_cost}))"
+
+
+def _items_price_stock_level_expr(conn: MySQLConnection, alias: str = "i") -> str:
+    """price × stock_level — matches Rio/SQL reporting for optimal-plan inventory value."""
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    if "price" not in item_cols or "stock_level" not in item_cols:
+        return "0"
+    price = f"COALESCE({alias}.{_sql_quote_identifier('price')}, 0)"
+    stock = f"COALESCE({alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    return f"({price} * {stock})"
+
+
 def _coerce_sql_date(value: Any) -> date | None:
     if value is None:
         return None
@@ -1989,11 +2014,10 @@ def _apply_due_on_order_to_stock(
 
 
 def _sim_optimal_plan_cost_exprs(conn: MySQLConnection, alias: str = "i") -> tuple[str, str, str]:
-    unit_cost = _items_unit_cost_expr(conn, alias)
+    inv_value = _items_price_stock_level_expr(conn, alias)
     holding_rate = DEEP_DIVE_INTEREST_RATE_PCT / 100.0
     shipping = DEEP_DIVE_FIXED_SHIPPING_USD
-    inv_value = f"(COALESCE(sr.inv, 0) * ({unit_cost}))"
-    inventory_cost = f"{inv_value} * ({holding_rate} / 365)"
+    inventory_cost = f"({inv_value}) * ({holding_rate} / 365)"
     fixed_shipping = (
         f"CASE WHEN COALESCE(sr.deliveries, 0) > 0 THEN {shipping} ELSE 0 END"
     )
@@ -2087,9 +2111,9 @@ def refresh_sim_optimal_plan_daily(conn: MySQLConnection, dates: list[Any] | Non
 
 def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
     """
-    Daily cost view from latest sim_result + items (Deep Dive / optimal plan).
+    Daily cost view from sim_result dates + items (Deep Dive / optimal plan).
 
-    - inv_value: inv × unit cost
+    - inv_value: price × stock_level (items)
     - inventory_cost: daily holding cost @ 18% árlega (18/365 per day)
     - fixed_shipping_cost: 90 USD on days with deliveries > 0 in sim_result
     """
@@ -2135,7 +2159,146 @@ def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
     conn.commit()
 
 
-SIM_OPTIMAL_PLAN_ITEM_ID_BATCH = 1000
+
+def _normalize_item_ids(item_ids: list[int] | None) -> list[int] | None:
+    if item_ids is None:
+        return None
+    return sorted({int(item_id) for item_id in item_ids if item_id is not None})
+
+
+def _item_id_in_clause(unique_ids: list[int]) -> tuple[str, tuple[int, ...]]:
+    placeholders = ",".join(["%s"] * len(unique_ids))
+    return f"IN ({placeholders})", tuple(unique_ids)
+
+
+def _sum_items_stock_value(
+    conn: MySQLConnection,
+    item_ids: list[int] | None,
+) -> tuple[int, float]:
+    """Return (items_count, sum_stock_value) for all items or a specific id list."""
+    ensure_table_exists(conn, "items")
+    stock_expr = _items_stock_value_expr(conn, "i")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0, 0.0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(*) AS items_count, SUM({stock_expr}) AS items_stock_value
+            FROM items i
+            WHERE i.id {in_clause}
+            """,
+            params,
+        )
+        if not row:
+            return 0, 0.0
+        return int(row.get("items_count") or 0), float(row.get("items_stock_value") or 0)
+
+    row = _get_single_row(
+        conn,
+        f"""
+        SELECT COUNT(*) AS items_count, SUM({stock_expr}) AS items_stock_value
+        FROM items i
+        """,
+        (),
+    )
+    if not row:
+        return 0, 0.0
+    return int(row.get("items_count") or 0), float(row.get("items_stock_value") or 0)
+
+
+def _sum_items_price_stock_level(
+    conn: MySQLConnection,
+    item_ids: list[int] | None,
+) -> tuple[int, float]:
+    """Return (items_count, sum(price × stock_level)) for all items or a specific id list."""
+    ensure_table_exists(conn, "items")
+    value_expr = _items_price_stock_level_expr(conn, "i")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0, 0.0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(*) AS items_count, SUM({value_expr}) AS items_price_stock_level
+            FROM items i
+            WHERE i.id {in_clause}
+            """,
+            params,
+        )
+        if not row:
+            return 0, 0.0
+        return int(row.get("items_count") or 0), float(row.get("items_price_stock_level") or 0)
+
+    row = _get_single_row(
+        conn,
+        f"""
+        SELECT COUNT(*) AS items_count, SUM({value_expr}) AS items_price_stock_level
+        FROM items i
+        """,
+        (),
+    )
+    if not row:
+        return 0, 0.0
+    return int(row.get("items_count") or 0), float(row.get("items_price_stock_level") or 0)
+
+
+def _count_sim_items(conn: MySQLConnection, item_ids: list[int] | None) -> int:
+    ensure_table_exists(conn, "sim_result")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(DISTINCT item_id) AS sim_items_count
+            FROM sim_result
+            WHERE item_id {in_clause}
+            """,
+            params,
+        )
+        return int((row or {}).get("sim_items_count") or 0)
+    row = _get_single_row(
+        conn,
+        "SELECT COUNT(DISTINCT item_id) AS sim_items_count FROM sim_result",
+        (),
+    )
+    return int((row or {}).get("sim_items_count") or 0)
+
+
+def get_sim_optimal_plan_summary(
+    database: str | None,
+    item_ids: list[int] | None,
+    series: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare items.stock_value with SUM(price × stock_level) for the same item set."""
+    with connection(database) as conn:
+        items_count, items_stock_value = _sum_items_stock_value(conn, item_ids)
+        _, items_price_stock_level = _sum_items_price_stock_level(conn, item_ids)
+        sim_items_count = _count_sim_items(conn, item_ids)
+
+    diff_value = items_price_stock_level - items_stock_value
+    diff_pct: float | None = None
+    if items_stock_value:
+        diff_pct = (diff_value / items_stock_value) * 100.0
+
+    return {
+        "scope": "filtered" if item_ids is not None else "all",
+        "items_count": items_count,
+        "sim_items_count": sim_items_count,
+        "items_stock_value": items_stock_value,
+        "items_price_stock_level": items_price_stock_level,
+        "sim_inv_value_today": items_price_stock_level,
+        "sim_day": None,
+        "diff_value": diff_value,
+        "diff_pct": diff_pct,
+    }
 
 
 def get_sim_optimal_plan_timeseries(
@@ -2160,43 +2323,41 @@ def get_sim_optimal_plan_timeseries(
                 rows = cursor.fetchall()
             return [normalize_row(row) for row in rows]
 
-        ensure_table_exists(conn, SIM_OPTIMAL_PLAN_DETAIL_VIEW)
-        unique_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+        unique_ids = _normalize_item_ids(item_ids) or []
         if not unique_ids:
             return []
 
-        totals_by_day: dict[Any, dict[str, Any]] = {}
-        for offset in range(0, len(unique_ids), SIM_OPTIMAL_PLAN_ITEM_ID_BATCH):
-            batch = unique_ids[offset : offset + SIM_OPTIMAL_PLAN_ITEM_ID_BATCH]
-            placeholders = ",".join(["%s"] * len(batch))
-            query = f"""
-                SELECT
-                    dags,
-                    SUM(inv_value) AS inv_value,
-                    SUM(inventory_cost) AS inventory_cost,
-                    SUM(fixed_shipping_cost) AS fixed_shipping_cost
-                FROM {quote_ident(SIM_OPTIMAL_PLAN_DETAIL_VIEW)}
-                WHERE item_id IN ({placeholders})
-                GROUP BY dags
-            """
-            with conn.cursor(dictionary=True) as cursor:
-                cursor.execute(query, batch)
-                for row in cursor.fetchall():
-                    day = row["dags"]
-                    if day not in totals_by_day:
-                        totals_by_day[day] = {
-                            "dags": day,
-                            "inv_value": 0.0,
-                            "inventory_cost": 0.0,
-                            "fixed_shipping_cost": 0.0,
-                        }
-                    bucket = totals_by_day[day]
-                    bucket["inv_value"] += float(row["inv_value"] or 0)
-                    bucket["inventory_cost"] += float(row["inventory_cost"] or 0)
-                    bucket["fixed_shipping_cost"] += float(row["fixed_shipping_cost"] or 0)
+        # price × stock_level comes from items (constant over sim days); only shipping varies by day.
+        _, total_inv_value = _sum_items_price_stock_level(conn, unique_ids)
+        holding_rate = DEEP_DIVE_INTEREST_RATE_PCT / 100.0
+        daily_inventory_cost = total_inv_value * (holding_rate / 365.0)
+        shipping = DEEP_DIVE_FIXED_SHIPPING_USD
+        fixed_shipping = (
+            f"CASE WHEN COALESCE(sr.deliveries, 0) > 0 THEN {shipping} ELSE 0 END"
+        )
+        in_clause, params = _item_id_in_clause(unique_ids)
+        query = f"""
+            SELECT
+                sr.sim_date AS dags,
+                SUM({fixed_shipping}) AS fixed_shipping_cost
+            FROM sim_result sr
+            WHERE sr.item_id {in_clause}
+            GROUP BY sr.sim_date
+            ORDER BY sr.sim_date
+        """
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
-        rows = sorted(totals_by_day.values(), key=lambda row: row["dags"])
-        return [normalize_row(row) for row in rows]
+        return [
+            normalize_row({
+                "dags": row["dags"],
+                "inv_value": total_inv_value,
+                "inventory_cost": daily_inventory_cost,
+                "fixed_shipping_cost": row["fixed_shipping_cost"],
+            })
+            for row in rows
+        ]
 
 
 def upsert_sim_result(
