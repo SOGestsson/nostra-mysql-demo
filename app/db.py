@@ -476,6 +476,15 @@ def _migrate_order_lines_purch_sugg_confirmed_column(conn: MySQLConnection) -> N
     conn.commit()
 
 
+def _migrate_order_lines_alt_pn_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'alt_pn'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN alt_pn VARCHAR(255) NULL DEFAULT NULL"
+            )
+
+
 def _migrate_order_lines_manual_columns(conn: MySQLConnection) -> None:
     with conn.cursor() as cursor:
         cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'is_manual'")
@@ -1169,6 +1178,10 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
         _migrate_order_lines_manual_columns(conn)
     except ValueError:
         pass
+    try:
+        _migrate_order_lines_alt_pn_column(conn)
+    except ValueError:
+        pass
 
 
 def create_order_from_purchase_suggestions(
@@ -1489,13 +1502,65 @@ def _order_items_select_sql(vendor_override_days: int, item_fields: str) -> str:
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
                 order_lines.assigned_to AS order_assigned_to,
-                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed,
+                order_lines.alt_pn AS order_alt_pn
             FROM {{from_clause}}
             {_item_override_join_sql(vendor_override_days)}
             {{where_clause}}
             {{order_clause}}
             LIMIT %s OFFSET %s
             """
+
+
+def _table_exists(conn: MySQLConnection, table_name: str) -> bool:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        return cursor.fetchone() is not None
+
+
+def _attach_alternative_parts(conn: MySQLConnection, rows: list[dict[str, Any]]) -> None:
+    """Attach alternative part numbers for each order line. Alts need not exist in items."""
+    for row in rows:
+        row["alternative_parts"] = []
+    if not rows or not _table_exists(conn, ALT_PARTS_TABLE):
+        return
+
+    with conn.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                TRIM(standard_pn) AS standard_pn,
+                TRIM(alt_pn) AS alt_pn
+            FROM {quote_ident(ALT_PARTS_TABLE)}
+            WHERE standard_pn IS NOT NULL AND TRIM(standard_pn) <> ''
+              AND alt_pn IS NOT NULL AND TRIM(alt_pn) <> ''
+            """
+        )
+        links = cursor.fetchall()
+
+    families: dict[str, set[str]] = {}
+    member_of: dict[str, set[str]] = {}
+    for link in links:
+        standard = str(link.get("standard_pn") or "").strip()
+        alt_pn = str(link.get("alt_pn") or "").strip()
+        if not standard or not alt_pn:
+            continue
+        families.setdefault(standard, set()).update({standard, alt_pn})
+        member_of.setdefault(standard, set()).add(standard)
+        member_of.setdefault(alt_pn, set()).add(standard)
+
+    for row in rows:
+        if row.get("order_is_manual") or row.get("order_line_id") is None:
+            continue
+        pn = str(row.get("item_number") or "").strip()
+        if not pn:
+            continue
+        options: set[str] = {pn}
+        for standard in member_of.get(pn, ()):
+            options.update(families.get(standard, set()))
+        if len(options) < 2:
+            continue
+        row["alternative_parts"] = sorted(options)
 
 
 def list_order_items(
@@ -1554,7 +1619,9 @@ def list_order_items(
                 order_clause="ORDER BY items.id",
             )
             params = (order_id, order_id, limit, offset)
-        return [_normalize_item_row(row) for row in _get_rows(conn, query, params)]
+        rows = [_normalize_item_row(row) for row in _get_rows(conn, query, params)]
+        _attach_alternative_parts(conn, [row for row in rows if row])
+        return rows
 
 
 def _normalize_item_number(item_number: str | None) -> str:
@@ -1625,7 +1692,8 @@ def _fetch_order_item_row(
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
                 order_lines.assigned_to AS order_assigned_to,
-                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed,
+                order_lines.alt_pn AS order_alt_pn
             FROM order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
             LEFT JOIN items ON items.id = order_lines.item_id
@@ -1933,6 +2001,7 @@ def merge_order_lines_from_order(
 # Deep Dive Opt defaults (see purch_sys_customers/src/config/deepDiveDefaults.js)
 DEEP_DIVE_FIXED_SHIPPING_USD = 90.0
 DEEP_DIVE_INTEREST_RATE_PCT = 18.0
+ALT_PARTS_TABLE = "alternative_parts_to_rapberry"
 SIM_OPTIMAL_PLAN_VIEW = "v_sim_optimal_plan"
 SIM_OPTIMAL_PLAN_DETAIL_VIEW = "v_sim_optimal_plan_detail"
 SIM_OPTIMAL_PLAN_DAILY_TABLE = "sim_optimal_plan_daily"
