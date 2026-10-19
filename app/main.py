@@ -664,13 +664,32 @@ def sim_input(
 def save_sim_result(
     payload: MultiSimResult,
     db_name: str = Query(..., alias="db"),
+    refresh_optimal_plan: bool = Query(True),
     authorization: str = Header(default=""),
 ) -> dict[str, Any]:
     require_request_user(authorization, db_name)
     try:
         rows = [row.model_dump() for row in payload.sim_result]
-        count = db.upsert_sim_result(rows, database=db_name)
+        count = db.upsert_sim_result(
+            rows,
+            database=db_name,
+            refresh_optimal_plan=refresh_optimal_plan,
+        )
         return {"saved": count}
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
+
+
+@app.post("/sim-optimal-plan/refresh", status_code=status.HTTP_200_OK)
+def refresh_sim_optimal_plan(
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        with db.connection(db_name) as conn:
+            row_count = db.refresh_sim_optimal_plan_daily(conn)
+        return {"refreshed_days": row_count}
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
@@ -687,7 +706,12 @@ def sim_optimal_plan_timeseries(
             database=db_name,
             item_ids=payload.item_ids,
         )
-        return {"series": series}
+        summary = db.get_sim_optimal_plan_summary(
+            database=db_name,
+            item_ids=payload.item_ids,
+            series=series,
+        )
+        return {"series": series, "summary": summary}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except mysql.connector.Error as extra:

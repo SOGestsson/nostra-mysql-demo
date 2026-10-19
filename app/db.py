@@ -418,7 +418,7 @@ def _item_override_select_fields() -> str:
 def get_item_with_overrides(item_id: int, database: str | None = None) -> dict[str, Any] | None:
     with connection(database) as conn:
         row = _fetch_item_with_overrides_conn(conn, item_id, database)
-        return normalize_row(row) if row else None
+        return _normalize_item_row(row)
 
 
 def _fetch_item_with_overrides_conn(
@@ -505,6 +505,15 @@ def _migrate_order_lines_purch_sugg_confirmed_column(conn: MySQLConnection) -> N
                 "ALTER TABLE order_lines ADD COLUMN purch_sugg_confirmed TINYINT NOT NULL DEFAULT 0"
             )
     conn.commit()
+
+
+def _migrate_order_lines_alt_pn_column(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW COLUMNS FROM order_lines LIKE 'alt_pn'")
+        if not cursor.fetchone():
+            cursor.execute(
+                "ALTER TABLE order_lines ADD COLUMN alt_pn VARCHAR(255) NULL DEFAULT NULL"
+            )
 
 
 def _migrate_order_lines_manual_columns(conn: MySQLConnection) -> None:
@@ -677,17 +686,19 @@ def list_rows(
             vendor_override_days = _get_vendor_override_days(database)
             join = _item_override_join_sql(vendor_override_days)
             select = f"SELECT {_item_override_select_fields()} FROM items {join}"
+            item_cols = {column.name for column in get_columns(conn, "items")}
             if stock_out:
-                where = append_sql_filter(
-                    "WHERE items.stock_level <= 0 OR items.stock_level IS NULL",
-                    sql_filter,
-                )
+                where = append_sql_filter(_sql_stock_out_predicate(item_cols), sql_filter)
                 query = f"{select} {where}"
                 params: tuple = ()
             else:
                 where = append_sql_filter("", sql_filter)
                 query = f"{select} {where} LIMIT %s OFFSET %s"
                 params = (limit, offset)
+            with conn.cursor(dictionary=True) as cursor:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+            return [_normalize_item_row(row) for row in rows]
         else:
             if stock_out:
                 where = append_sql_filter(
@@ -846,6 +857,7 @@ def get_sim_input_data(
         item = _fetch_item_with_overrides_conn(conn, item_id, database)
         if not item:
             raise ValueError(f"Item not found: {item_id}")
+        _resolve_item_stock_row(item)
 
         item_number = item.get("item_number") or ""
         history_rows = _fetch_item_history_sales(conn, database, item_id, item_number)
@@ -1274,6 +1286,10 @@ def _ensure_orders_tables(conn: MySQLConnection) -> None:
         _migrate_order_lines_manual_columns(conn)
     except ValueError:
         pass
+    try:
+        _migrate_order_lines_alt_pn_column(conn)
+    except ValueError:
+        pass
 
 
 def create_order_from_purchase_suggestions(
@@ -1413,6 +1429,32 @@ def _sql_item_col(item_cols: set[str], name: str, alias: str | None = None) -> s
     return f"NULL AS {out_sql}"
 
 
+def _sql_effective_stock_level(item_cols: set[str]) -> str:
+    """Prefer live_avail_qty (ERP stock) over legacy stock_level when present."""
+    live = "live_avail_qty"
+    stock = "stock_level"
+    if live in item_cols:
+        if stock in item_cols:
+            return (
+                f"COALESCE(items.{_sql_quote_identifier(live)}, "
+                f"items.{_sql_quote_identifier(stock)}) AS stock_level"
+            )
+        return f"items.{_sql_quote_identifier(live)} AS stock_level"
+    return _sql_item_col(item_cols, stock)
+
+
+def _sql_stock_out_predicate(item_cols: set[str], table_prefix: str = "items") -> str:
+    live = f"{table_prefix}.{_sql_quote_identifier('live_avail_qty')}"
+    stock = f"{table_prefix}.{_sql_quote_identifier('stock_level')}"
+    if "live_avail_qty" in item_cols:
+        parts = [live]
+        if "stock_level" in item_cols:
+            parts.append(stock)
+        coalesce = f"COALESCE({', '.join(parts)}, 0)"
+        return f"WHERE {coalesce} <= 0"
+    return f"WHERE {stock} <= 0 OR {stock} IS NULL"
+
+
 _ORDER_LINE_EXPLICIT_ITEM_COLS = {
     "id",
     "item_number",
@@ -1511,7 +1553,7 @@ def _order_line_display_item_fields(conn: MySQLConnection) -> str:
         id_sql,
         item_number_sql,
         description_sql,
-        _sql_item_col(item_cols, "stock_level"),
+        _sql_effective_stock_level(item_cols),
         _sql_item_col(item_cols, "qty_on_order"),
         _sql_item_col(item_cols, "purchase_suggestion"),
         _sql_item_col(item_cols, "buy_freq"),
@@ -1568,13 +1610,65 @@ def _order_items_select_sql(vendor_override_days: int, item_fields: str) -> str:
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
                 order_lines.assigned_to AS order_assigned_to,
-                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed,
+                order_lines.alt_pn AS order_alt_pn
             FROM {{from_clause}}
             {_item_override_join_sql(vendor_override_days)}
             {{where_clause}}
             {{order_clause}}
             LIMIT %s OFFSET %s
             """
+
+
+def _table_exists(conn: MySQLConnection, table_name: str) -> bool:
+    with conn.cursor() as cursor:
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        return cursor.fetchone() is not None
+
+
+def _attach_alternative_parts(conn: MySQLConnection, rows: list[dict[str, Any]]) -> None:
+    """Attach alternative part numbers for each order line. Alts need not exist in items."""
+    for row in rows:
+        row["alternative_parts"] = []
+    if not rows or not _table_exists(conn, ALT_PARTS_TABLE):
+        return
+
+    with conn.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                TRIM(standard_pn) AS standard_pn,
+                TRIM(alt_pn) AS alt_pn
+            FROM {quote_ident(ALT_PARTS_TABLE)}
+            WHERE standard_pn IS NOT NULL AND TRIM(standard_pn) <> ''
+              AND alt_pn IS NOT NULL AND TRIM(alt_pn) <> ''
+            """
+        )
+        links = cursor.fetchall()
+
+    families: dict[str, set[str]] = {}
+    member_of: dict[str, set[str]] = {}
+    for link in links:
+        standard = str(link.get("standard_pn") or "").strip()
+        alt_pn = str(link.get("alt_pn") or "").strip()
+        if not standard or not alt_pn:
+            continue
+        families.setdefault(standard, set()).update({standard, alt_pn})
+        member_of.setdefault(standard, set()).add(standard)
+        member_of.setdefault(alt_pn, set()).add(standard)
+
+    for row in rows:
+        if row.get("order_is_manual") or row.get("order_line_id") is None:
+            continue
+        pn = str(row.get("item_number") or "").strip()
+        if not pn:
+            continue
+        options: set[str] = {pn}
+        for standard in member_of.get(pn, ()):
+            options.update(families.get(standard, set()))
+        if len(options) < 2:
+            continue
+        row["alternative_parts"] = sorted(options)
 
 
 def list_order_items(
@@ -1616,11 +1710,10 @@ def list_order_items(
             )
             params = (order_id, limit, offset)
         else:
-            stock_filter = (
-                " AND (items.stock_level <= 0 OR items.stock_level IS NULL)"
-                if stock_out
-                else ""
-            )
+            item_cols = {column.name for column in get_columns(conn, "items")}
+            stock_filter = ""
+            if stock_out:
+                stock_filter = " AND " + _sql_stock_out_predicate(item_cols).removeprefix("WHERE ")
             where_clause = append_sql_filter(f"WHERE 1=1{stock_filter}", sql_filter)
             query = select_sql.format(
                 from_clause="""
@@ -1635,11 +1728,13 @@ def list_order_items(
             )
             params = (order_id, order_id, limit, offset)
         try:
-            return _get_rows(conn, query, params)
+            rows = [_normalize_item_row(row) for row in _get_rows(conn, query, params)]
         except mysql.connector.Error as exc:
             if sql_filter:
                 raise ValueError(f"SQL filter failed: {exc.msg}") from exc
             raise
+        _attach_alternative_parts(conn, [row for row in rows if row])
+        return rows
 
 
 def _normalize_item_number(item_number: str | None) -> str:
@@ -1668,7 +1763,7 @@ def get_item_by_item_number(item_number: str, database: str | None = None) -> di
             ),
             (pn,),
         )
-        return normalize_row(row) if row else None
+        return _normalize_item_row(row)
 
 
 def _fetch_order_item_row(
@@ -1710,7 +1805,8 @@ def _fetch_order_item_row(
                 order_lines.status AS order_line_status,
                 order_lines.progress AS order_line_progress,
                 order_lines.assigned_to AS order_assigned_to,
-                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed
+                order_lines.purch_sugg_confirmed AS order_purch_sugg_confirmed,
+                order_lines.alt_pn AS order_alt_pn
             FROM order_lines
             INNER JOIN orders ON orders.id = order_lines.order_id
             LEFT JOIN items ON items.id = order_lines.item_id
@@ -1721,7 +1817,7 @@ def _fetch_order_item_row(
             LIMIT 1
             """
     row = _get_single_row(conn, query, (order_id, order_line_id))
-    return normalize_row(row) if row else None
+    return _normalize_item_row(row)
 
 
 def add_order_line(
@@ -2018,6 +2114,7 @@ def merge_order_lines_from_order(
 # Deep Dive Opt defaults (see purch_sys_customers/src/config/deepDiveDefaults.js)
 DEEP_DIVE_FIXED_SHIPPING_USD = 90.0
 DEEP_DIVE_INTEREST_RATE_PCT = 18.0
+ALT_PARTS_TABLE = "alternative_parts_to_rapberry"
 SIM_OPTIMAL_PLAN_VIEW = "v_sim_optimal_plan"
 SIM_OPTIMAL_PLAN_DETAIL_VIEW = "v_sim_optimal_plan_detail"
 SIM_OPTIMAL_PLAN_DAILY_TABLE = "sim_optimal_plan_daily"
@@ -2037,6 +2134,31 @@ def _items_unit_cost_expr(conn: MySQLConnection, alias: str = "i") -> str:
     if len(parts) == 1:
         return f"COALESCE({parts[0]}, 0)"
     return f"COALESCE({parts[0]}, {parts[1]}, 0)"
+
+
+def _items_stock_value_expr(conn: MySQLConnection, alias: str = "i") -> str:
+    """Rio stock_value when present, else stock_level × unit cost."""
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    if "stock_value" in item_cols:
+        return f"COALESCE({alias}.{_sql_quote_identifier('stock_value')}, 0)"
+    unit_cost = _items_unit_cost_expr(conn, alias)
+    if "live_avail_qty" in item_cols:
+        qty = f"COALESCE({alias}.{_sql_quote_identifier('live_avail_qty')}, {alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    elif "stock_level" in item_cols:
+        qty = f"COALESCE({alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    else:
+        qty = "0"
+    return f"({qty} * ({unit_cost}))"
+
+
+def _items_price_stock_level_expr(conn: MySQLConnection, alias: str = "i") -> str:
+    """price × stock_level — matches Rio/SQL reporting for optimal-plan inventory value."""
+    item_cols = {column.name for column in get_columns(conn, "items")}
+    if "price" not in item_cols or "stock_level" not in item_cols:
+        return "0"
+    price = f"COALESCE({alias}.{_sql_quote_identifier('price')}, 0)"
+    stock = f"COALESCE({alias}.{_sql_quote_identifier('stock_level')}, 0)"
+    return f"({price} * {stock})"
 
 
 def _coerce_sql_date(value: Any) -> date | None:
@@ -2074,11 +2196,10 @@ def _apply_due_on_order_to_stock(
 
 
 def _sim_optimal_plan_cost_exprs(conn: MySQLConnection, alias: str = "i") -> tuple[str, str, str]:
-    unit_cost = _items_unit_cost_expr(conn, alias)
+    inv_value = _items_price_stock_level_expr(conn, alias)
     holding_rate = DEEP_DIVE_INTEREST_RATE_PCT / 100.0
     shipping = DEEP_DIVE_FIXED_SHIPPING_USD
-    inv_value = f"(COALESCE(sr.inv, 0) * ({unit_cost}))"
-    inventory_cost = f"{inv_value} * ({holding_rate} / 365)"
+    inventory_cost = f"({inv_value}) * ({holding_rate} / 365)"
     fixed_shipping = (
         f"CASE WHEN COALESCE(sr.deliveries, 0) > 0 THEN {shipping} ELSE 0 END"
     )
@@ -2172,9 +2293,9 @@ def refresh_sim_optimal_plan_daily(conn: MySQLConnection, dates: list[Any] | Non
 
 def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
     """
-    Daily cost view from latest sim_result + items (Deep Dive / optimal plan).
+    Daily cost view from sim_result dates + items (Deep Dive / optimal plan).
 
-    - inv_value: inv × unit cost
+    - inv_value: price × stock_level (items)
     - inventory_cost: daily holding cost @ 18% árlega (18/365 per day)
     - fixed_shipping_cost: 90 USD on days with deliveries > 0 in sim_result
     """
@@ -2220,7 +2341,146 @@ def ensure_sim_optimal_plan_view(conn: MySQLConnection) -> None:
     conn.commit()
 
 
-SIM_OPTIMAL_PLAN_ITEM_ID_BATCH = 1000
+
+def _normalize_item_ids(item_ids: list[int] | None) -> list[int] | None:
+    if item_ids is None:
+        return None
+    return sorted({int(item_id) for item_id in item_ids if item_id is not None})
+
+
+def _item_id_in_clause(unique_ids: list[int]) -> tuple[str, tuple[int, ...]]:
+    placeholders = ",".join(["%s"] * len(unique_ids))
+    return f"IN ({placeholders})", tuple(unique_ids)
+
+
+def _sum_items_stock_value(
+    conn: MySQLConnection,
+    item_ids: list[int] | None,
+) -> tuple[int, float]:
+    """Return (items_count, sum_stock_value) for all items or a specific id list."""
+    ensure_table_exists(conn, "items")
+    stock_expr = _items_stock_value_expr(conn, "i")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0, 0.0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(*) AS items_count, SUM({stock_expr}) AS items_stock_value
+            FROM items i
+            WHERE i.id {in_clause}
+            """,
+            params,
+        )
+        if not row:
+            return 0, 0.0
+        return int(row.get("items_count") or 0), float(row.get("items_stock_value") or 0)
+
+    row = _get_single_row(
+        conn,
+        f"""
+        SELECT COUNT(*) AS items_count, SUM({stock_expr}) AS items_stock_value
+        FROM items i
+        """,
+        (),
+    )
+    if not row:
+        return 0, 0.0
+    return int(row.get("items_count") or 0), float(row.get("items_stock_value") or 0)
+
+
+def _sum_items_price_stock_level(
+    conn: MySQLConnection,
+    item_ids: list[int] | None,
+) -> tuple[int, float]:
+    """Return (items_count, sum(price × stock_level)) for all items or a specific id list."""
+    ensure_table_exists(conn, "items")
+    value_expr = _items_price_stock_level_expr(conn, "i")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0, 0.0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(*) AS items_count, SUM({value_expr}) AS items_price_stock_level
+            FROM items i
+            WHERE i.id {in_clause}
+            """,
+            params,
+        )
+        if not row:
+            return 0, 0.0
+        return int(row.get("items_count") or 0), float(row.get("items_price_stock_level") or 0)
+
+    row = _get_single_row(
+        conn,
+        f"""
+        SELECT COUNT(*) AS items_count, SUM({value_expr}) AS items_price_stock_level
+        FROM items i
+        """,
+        (),
+    )
+    if not row:
+        return 0, 0.0
+    return int(row.get("items_count") or 0), float(row.get("items_price_stock_level") or 0)
+
+
+def _count_sim_items(conn: MySQLConnection, item_ids: list[int] | None) -> int:
+    ensure_table_exists(conn, "sim_result")
+    unique_ids = _normalize_item_ids(item_ids)
+    if unique_ids is not None:
+        if not unique_ids:
+            return 0
+        in_clause, params = _item_id_in_clause(unique_ids)
+        row = _get_single_row(
+            conn,
+            f"""
+            SELECT COUNT(DISTINCT item_id) AS sim_items_count
+            FROM sim_result
+            WHERE item_id {in_clause}
+            """,
+            params,
+        )
+        return int((row or {}).get("sim_items_count") or 0)
+    row = _get_single_row(
+        conn,
+        "SELECT COUNT(DISTINCT item_id) AS sim_items_count FROM sim_result",
+        (),
+    )
+    return int((row or {}).get("sim_items_count") or 0)
+
+
+def get_sim_optimal_plan_summary(
+    database: str | None,
+    item_ids: list[int] | None,
+    series: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare items.stock_value with SUM(price × stock_level) for the same item set."""
+    with connection(database) as conn:
+        items_count, items_stock_value = _sum_items_stock_value(conn, item_ids)
+        _, items_price_stock_level = _sum_items_price_stock_level(conn, item_ids)
+        sim_items_count = _count_sim_items(conn, item_ids)
+
+    diff_value = items_price_stock_level - items_stock_value
+    diff_pct: float | None = None
+    if items_stock_value:
+        diff_pct = (diff_value / items_stock_value) * 100.0
+
+    return {
+        "scope": "filtered" if item_ids is not None else "all",
+        "items_count": items_count,
+        "sim_items_count": sim_items_count,
+        "items_stock_value": items_stock_value,
+        "items_price_stock_level": items_price_stock_level,
+        "sim_inv_value_today": items_price_stock_level,
+        "sim_day": None,
+        "diff_value": diff_value,
+        "diff_pct": diff_pct,
+    }
 
 
 def get_sim_optimal_plan_timeseries(
@@ -2245,46 +2505,49 @@ def get_sim_optimal_plan_timeseries(
                 rows = cursor.fetchall()
             return [normalize_row(row) for row in rows]
 
-        ensure_table_exists(conn, SIM_OPTIMAL_PLAN_DETAIL_VIEW)
-        unique_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+        unique_ids = _normalize_item_ids(item_ids) or []
         if not unique_ids:
             return []
 
-        totals_by_day: dict[Any, dict[str, Any]] = {}
-        for offset in range(0, len(unique_ids), SIM_OPTIMAL_PLAN_ITEM_ID_BATCH):
-            batch = unique_ids[offset : offset + SIM_OPTIMAL_PLAN_ITEM_ID_BATCH]
-            placeholders = ",".join(["%s"] * len(batch))
-            query = f"""
-                SELECT
-                    dags,
-                    SUM(inv_value) AS inv_value,
-                    SUM(inventory_cost) AS inventory_cost,
-                    SUM(fixed_shipping_cost) AS fixed_shipping_cost
-                FROM {quote_ident(SIM_OPTIMAL_PLAN_DETAIL_VIEW)}
-                WHERE item_id IN ({placeholders})
-                GROUP BY dags
-            """
-            with conn.cursor(dictionary=True) as cursor:
-                cursor.execute(query, batch)
-                for row in cursor.fetchall():
-                    day = row["dags"]
-                    if day not in totals_by_day:
-                        totals_by_day[day] = {
-                            "dags": day,
-                            "inv_value": 0.0,
-                            "inventory_cost": 0.0,
-                            "fixed_shipping_cost": 0.0,
-                        }
-                    bucket = totals_by_day[day]
-                    bucket["inv_value"] += float(row["inv_value"] or 0)
-                    bucket["inventory_cost"] += float(row["inventory_cost"] or 0)
-                    bucket["fixed_shipping_cost"] += float(row["fixed_shipping_cost"] or 0)
+        # price × stock_level comes from items (constant over sim days); only shipping varies by day.
+        _, total_inv_value = _sum_items_price_stock_level(conn, unique_ids)
+        holding_rate = DEEP_DIVE_INTEREST_RATE_PCT / 100.0
+        daily_inventory_cost = total_inv_value * (holding_rate / 365.0)
+        shipping = DEEP_DIVE_FIXED_SHIPPING_USD
+        fixed_shipping = (
+            f"CASE WHEN COALESCE(sr.deliveries, 0) > 0 THEN {shipping} ELSE 0 END"
+        )
+        in_clause, params = _item_id_in_clause(unique_ids)
+        query = f"""
+            SELECT
+                sr.sim_date AS dags,
+                SUM({fixed_shipping}) AS fixed_shipping_cost
+            FROM sim_result sr
+            WHERE sr.item_id {in_clause}
+            GROUP BY sr.sim_date
+            ORDER BY sr.sim_date
+        """
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
-        rows = sorted(totals_by_day.values(), key=lambda row: row["dags"])
-        return [normalize_row(row) for row in rows]
+        return [
+            normalize_row({
+                "dags": row["dags"],
+                "inv_value": total_inv_value,
+                "inventory_cost": daily_inventory_cost,
+                "fixed_shipping_cost": row["fixed_shipping_cost"],
+            })
+            for row in rows
+        ]
 
 
-def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -> int:
+def upsert_sim_result(
+    rows: list[dict[str, Any]],
+    database: str | None = None,
+    *,
+    refresh_optimal_plan: bool = True,
+) -> int:
     if not rows:
         return 0
 
@@ -2312,12 +2575,13 @@ def upsert_sim_result(rows: list[dict[str, Any]], database: str | None = None) -
                 """,
                 rows,
             )
-        dates_after = {
-            d
-            for d in (_coerce_sql_date(row.get("sim_date")) for row in rows)
-            if d is not None
-        }
-        refresh_sim_optimal_plan_daily(conn, dates=list(dates_before | dates_after))
+        if refresh_optimal_plan:
+            dates_after = {
+                d
+                for d in (_coerce_sql_date(row.get("sim_date")) for row in rows)
+                if d is not None
+            }
+            refresh_sim_optimal_plan_daily(conn, dates=list(dates_before | dates_after))
         return len(rows)
 
 
@@ -2706,6 +2970,22 @@ def run_roi_point_estimate(
     saved = upsert_roi_result(result, database=database) if persist else 0
     result["saved"] = saved
     return result
+
+
+def _resolve_item_stock_row(row: dict[str, Any]) -> dict[str, Any]:
+    """When live_avail_qty exists, treat it as canonical stock in stock_level."""
+    if not row or "live_avail_qty" not in row:
+        return row
+    live = row.get("live_avail_qty")
+    if live is not None:
+        row["stock_level"] = live
+    return row
+
+
+def _normalize_item_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    return _resolve_item_stock_row(normalize_row(row))
 
 
 def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
