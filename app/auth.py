@@ -9,6 +9,12 @@ import jwt
 import mysql.connector
 
 from app import db
+from app.m7_access import (
+    M7_PRODUCT,
+    assert_create_user_allowed,
+    databases_visible_to,
+    user_may_open_database,
+)
 
 logger = logging.getLogger(__name__)
 _DEFAULT_JWT_SECRET = "nostradamus-secret-key"
@@ -62,6 +68,23 @@ def ensure_users_table() -> None:
             if cursor.fetchone()[0] == 0:
                 cursor.execute("ALTER TABLE users ADD COLUMN last_seen_at DATETIME NULL")
             cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = 'nostradamus_master' AND table_name = 'users' AND column_name = 'is_m7_admin'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE users ADD COLUMN is_m7_admin TINYINT(1) NOT NULL DEFAULT 0"
+                )
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.columns "
+                "WHERE table_schema = 'nostradamus_master' AND table_name = 'database_connections' "
+                "AND column_name = 'product'"
+            )
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "ALTER TABLE database_connections ADD COLUMN product VARCHAR(32) NULL"
+                )
+            cursor.execute(
                 """
                 CREATE TABLE IF NOT EXISTS db_ui_config (
                     db_name VARCHAR(100) PRIMARY KEY,
@@ -101,7 +124,14 @@ def ensure_users_table() -> None:
         conn.close()
 
 
-def register_user(username: str, email: str, password: str, database_name: str, is_admin: bool = False) -> dict:
+def register_user(
+    username: str,
+    email: str,
+    password: str,
+    database_name: str,
+    is_admin: bool = False,
+    is_m7_admin: bool = False,
+) -> dict:
     if len(password or "") < 8:
         raise ValueError("Password must be at least 8 characters")
     # verify database exists and is active
@@ -117,8 +147,11 @@ def register_user(username: str, email: str, password: str, database_name: str, 
                 raise ValueError("Email already registered")
 
             cursor.execute(
-                "INSERT INTO users (username, email, password_hash, database_name, is_admin) VALUES (%s, %s, %s, %s, %s)",
-                (username, email, password_hash, database_name, int(is_admin)),
+                """
+                INSERT INTO users (username, email, password_hash, database_name, is_admin, is_m7_admin)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (username, email, password_hash, database_name, int(is_admin), int(is_m7_admin)),
             )
             conn.commit()
             user_id = cursor.lastrowid
@@ -126,7 +159,14 @@ def register_user(username: str, email: str, password: str, database_name: str, 
     finally:
         conn.close()
 
-    return {"id": user_id, "username": username, "email": email, "database_name": database_name, "is_admin": is_admin}
+    return {
+        "id": user_id,
+        "username": username,
+        "email": email,
+        "database_name": database_name,
+        "is_admin": is_admin,
+        "is_m7_admin": is_m7_admin,
+    }
 
 
 def login_user(email: str, password: str) -> dict:
@@ -134,7 +174,10 @@ def login_user(email: str, password: str) -> dict:
     try:
         with conn.cursor(dictionary=True) as cursor:
             cursor.execute(
-                "SELECT id, username, email, password_hash, database_name, is_admin FROM users WHERE email = %s",
+                """
+                SELECT id, username, email, password_hash, database_name, is_admin, is_m7_admin
+                FROM users WHERE email = %s
+                """,
                 (email,),
             )
             user = cursor.fetchone()
@@ -150,6 +193,7 @@ def login_user(email: str, password: str) -> dict:
         "email": user["email"],
         "database_name": user["database_name"],
         "is_admin": bool(user["is_admin"]),
+        "is_m7_admin": bool(user.get("is_m7_admin")),
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -162,6 +206,7 @@ def login_user(email: str, password: str) -> dict:
             "email": user["email"],
             "database_name": user["database_name"],
             "is_admin": bool(user["is_admin"]),
+            "is_m7_admin": bool(user.get("is_m7_admin")),
         },
     }
 
@@ -303,6 +348,7 @@ def list_users() -> list[dict]:
                     u.email,
                     u.database_name,
                     u.is_admin,
+                    u.is_m7_admin,
                     u.created_at,
                     u.last_seen_at,
                     (
@@ -321,6 +367,7 @@ def list_users() -> list[dict]:
         {
             **row,
             "is_admin": bool(row["is_admin"]),
+            "is_m7_admin": bool(row.get("is_m7_admin")),
             "created_at": _fmt_dt(row["created_at"]),
             "last_login_at": _fmt_dt(row["last_login_at"]),
             "last_seen_at": _fmt_dt(row.get("last_seen_at")),
@@ -351,12 +398,72 @@ def list_users_for_database(database_name: str) -> list[dict]:
     return rows
 
 
+def database_product(database_name: str) -> str:
+    name = (database_name or "").strip()
+    if not name:
+        raise ValueError("database_name is required")
+    conn = _master_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COALESCE(product, '') FROM database_connections WHERE name = %s AND is_active = 1",
+                (name,),
+            )
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise ValueError("Unknown database")
+    return row[0] or ""
+
+
+def m7_database_names() -> set[str]:
+    conn = _master_conn()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT name FROM database_connections WHERE is_active = 1 AND product = %s",
+                (M7_PRODUCT,),
+            )
+            rows = cursor.fetchall()
+    finally:
+        conn.close()
+    return {row[0] for row in rows}
+
+
+def get_user_record(user_id: int) -> dict | None:
+    conn = _master_conn()
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            cursor.execute(
+                "SELECT id, database_name, is_admin, is_m7_admin FROM users WHERE id = %s",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "database_name": row["database_name"],
+        "is_admin": bool(row["is_admin"]),
+        "is_m7_admin": bool(row.get("is_m7_admin")),
+    }
+
+
 def require_db_users_access(token: str, database_name: str) -> dict:
     payload = verify_token(token)
     db_name = (database_name or "").strip()
     if not db_name:
         raise ValueError("db is required")
-    if not payload.get("is_admin") and payload.get("database_name") != db_name:
+    product = ""
+    if payload.get("is_m7_admin") and not payload.get("is_admin"):
+        try:
+            product = database_product(db_name)
+        except ValueError as exc:
+            raise ValueError("Access denied for this database") from exc
+    if not user_may_open_database(payload, db_name, product):
         raise ValueError("Access denied for this database")
     return payload
 

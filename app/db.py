@@ -204,12 +204,24 @@ def list_active_databases() -> list[dict[str, str]]:
     try:
         with master.cursor(dictionary=True) as cursor:
             cursor.execute(
-                "SELECT name, display_name FROM database_connections WHERE is_active = 1 ORDER BY display_name"
+                """
+                SELECT name, display_name, COALESCE(product, '') AS product
+                FROM database_connections
+                WHERE is_active = 1
+                ORDER BY display_name
+                """
             )
             rows = cursor.fetchall()
     finally:
         master.close()
-    return [{"name": row["name"], "display_name": row["display_name"] or row["name"]} for row in rows]
+    return [
+        {
+            "name": row["name"],
+            "display_name": row["display_name"] or row["name"],
+            "product": row.get("product") or "",
+        }
+        for row in rows
+    ]
 
 
 def get_connection(database: str | None = None) -> MySQLConnection:

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app import db, auth as auth_module, forecast as forecast_module, ui_config as ui_config_module, assistant as assistant_module
+from app.m7_schema import CREATE_TABLES, LiveDatabaseRefused, assert_m7_database_allowed
 from app.security import check_login_rate, client_ip, cors_allow_origins, docs_enabled, require_request_user
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class RegisterRequest(BaseModel):
     password: str
     database_name: str
     is_admin: bool = False
+    is_m7_admin: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -185,10 +187,26 @@ def register(payload: RegisterRequest, authorization: str = Header(default="")) 
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 
+def _require_user_manager(authorization: str) -> dict:
+    actor = require_request_user(authorization)
+    if not actor.get("is_admin") and not actor.get("is_m7_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return actor
+
+
 @app.get("/admin/users")
 def admin_list_users(authorization: str = Header(default="")) -> dict:
-    require_request_user(authorization, admin=True)
-    return {"users": auth_module.list_users()}
+    actor = _require_user_manager(authorization)
+    users = auth_module.list_users()
+    if actor.get("is_admin"):
+        return {"users": users}
+    allowed = auth_module.m7_database_names()
+    return {
+        "users": [
+            row for row in users
+            if row.get("database_name") in allowed and not row.get("is_admin")
+        ]
+    }
 
 
 @app.get("/admin/users/{user_id}/login-history")
@@ -197,7 +215,16 @@ def admin_login_history(
     authorization: str = Header(default=""),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict:
-    require_request_user(authorization, admin=True)
+    actor = _require_user_manager(authorization)
+    if not actor.get("is_admin"):
+        target = auth_module.get_user_record(user_id)
+        allowed = auth_module.m7_database_names()
+        if (
+            not target
+            or target.get("is_admin")
+            or target.get("database_name") not in allowed
+        ):
+            raise HTTPException(status_code=403, detail="Admin access required")
     return {"user_id": user_id, "history": auth_module.list_login_history(user_id, limit=limit)}
 
 
@@ -212,18 +239,34 @@ def list_db_users(
 
 @app.post("/admin/users", status_code=status.HTTP_201_CREATED)
 def admin_create_user(payload: RegisterRequest, authorization: str = Header(default="")) -> dict:
-    require_request_user(authorization, admin=True)
+    actor = _require_user_manager(authorization)
     try:
+        product = auth_module.database_product(payload.database_name)
+        auth_module.assert_create_user_allowed(
+            actor,
+            product=product,
+            is_admin=payload.is_admin,
+            is_m7_admin=payload.is_m7_admin,
+        )
+        grant_platform = bool(payload.is_admin) and bool(actor.get("is_admin"))
+        grant_m7 = bool(payload.is_m7_admin) and bool(actor.get("is_admin")) and not grant_platform
         user = auth_module.register_user(
             username=payload.username,
             email=payload.email,
             password=payload.password,
             database_name=payload.database_name,
-            is_admin=payload.is_admin,
+            is_admin=grant_platform,
+            is_m7_admin=grant_m7,
         )
         return {"user": user}
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        message = str(exc)
+        code = 403 if message in {
+            "Admin access required",
+            "M7 admin cannot grant admin access",
+            "M7 admin can only create users for M7 companies",
+        } else 400
+        raise HTTPException(status_code=code, detail=message) from exc
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
 
@@ -309,7 +352,17 @@ def set_db_config(
 
 @app.delete("/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 def admin_delete_user(user_id: int, authorization: str = Header(default="")) -> Response:
-    require_request_user(authorization, admin=True)
+    actor = _require_user_manager(authorization)
+    if not actor.get("is_admin"):
+        target = auth_module.get_user_record(user_id)
+        allowed = auth_module.m7_database_names()
+        if (
+            not target
+            or target.get("is_admin")
+            or target.get("is_m7_admin")
+            or target.get("database_name") not in allowed
+        ):
+            raise HTTPException(status_code=403, detail="Admin access required")
     deleted = auth_module.delete_user(user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
@@ -485,6 +538,25 @@ def health(check_engine: bool = Query(default=False)) -> dict[str, Any]:
     return {"status": "ok"}
 
 
+@app.get("/m7/status")
+def m7_status(
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    """Say whether this database may receive M7 tables. Does not create them."""
+    require_request_user(authorization, db_name)
+    try:
+        assert_m7_database_allowed(db_name)
+    except LiveDatabaseRefused as exc:
+        return {"database": db_name, "allowed": False, "detail": str(exc), "tables": []}
+    return {
+        "database": db_name,
+        "allowed": True,
+        "detail": "M7 tables are not created by this request.",
+        "tables": list(CREATE_TABLES),
+    }
+
+
 @app.get("/databases")
 def databases(authorization: str = Header(default="")) -> dict[str, list[dict[str, str]]]:
     user = require_request_user(authorization)
@@ -492,10 +564,7 @@ def databases(authorization: str = Header(default="")) -> dict[str, list[dict[st
         all_dbs = db.list_active_databases()
     except mysql.connector.Error as exc:
         raise HTTPException(status_code=500, detail=exc.msg) from exc
-    if user.get("is_admin"):
-        return {"databases": all_dbs}
-    allowed = user.get("database_name")
-    return {"databases": [row for row in all_dbs if row.get("name") == allowed]}
+    return {"databases": auth_module.databases_visible_to(user, all_dbs)}
 
 
 @app.get("/tables/{table_name}/columns")
