@@ -333,6 +333,7 @@ USER_DB_CONFIG_FIELDS: dict[str, str] = {
     "roiShowRowNumbers": "bool",
     "roiGridPaging": "grid_paging",
     "roiSavedWhereFilters": "saved_where_filters",
+    "includeReservedInStock": "bool",
 }
 
 

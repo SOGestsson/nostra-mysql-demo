@@ -61,6 +61,7 @@ REMOTE_CMD="
     -e JWT_SECRET=$JWT_SECRET \
     -e FORECAST_API_URL=${FORECAST_API_URL:-https://api.nostradamus-api.com} \
     -e FORECAST_API_TIMEOUT=${FORECAST_API_TIMEOUT:-120} \
+    -e ENABLE_DOCS=true \
     $OPENCLAW_ENV \
     $LLM_ENV \
     $IMAGE &&

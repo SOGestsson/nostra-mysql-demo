@@ -17,6 +17,10 @@ from app.security import check_login_rate, client_ip, cors_allow_origins, docs_e
 logger = logging.getLogger(__name__)
 
 
+class OrderLineIdsPayload(BaseModel):
+    line_ids: list[int] = Field(default_factory=list, max_length=20000)
+
+
 class PurchaseSuggestion(BaseModel):
     item_id: int
     purchase_qty: float | None = None
@@ -135,6 +139,7 @@ class UserDbConfigPayload(BaseModel):
     roiShowRowNumbers: bool | None = None
     roiGridPaging: str | None = None
     roiSavedWhereFilters: list[ui_config_module.SavedWhereFilter] | None = None
+    includeReservedInStock: bool | None = None
 
 
 class ProgressStatusColorsPayload(BaseModel):
@@ -787,6 +792,20 @@ def list_orders(
         raise HTTPException(status_code=500, detail=extra.msg) from extra
 
 
+@app.post("/order-lines/by-ids")
+def order_lines_by_ids(
+    payload: OrderLineIdsPayload,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    require_request_user(authorization, db_name)
+    try:
+        rows = db.list_order_lines_by_ids(payload.line_ids, database=db_name)
+        return {"count": len(rows), "rows": rows}
+    except mysql.connector.Error as extra:
+        raise HTTPException(status_code=500, detail=extra.msg) from extra
+
+
 @app.get("/orders/{order_id}/items")
 def list_order_items(
     order_id: int,
@@ -795,6 +814,7 @@ def list_order_items(
     offset: int = Query(default=0, ge=0),
     order_lines_only: bool = Query(default=True),
     stock_out: bool = Query(default=False),
+    include_reserved_in_stock: bool = Query(default=False),
     sql_grid: str | None = Query(default=None, alias="sqlGrid"),
     authorization: str = Header(default=""),
 ) -> dict[str, Any]:
@@ -807,6 +827,7 @@ def list_order_items(
             offset=offset,
             order_lines_only=order_lines_only,
             stock_out=stock_out,
+            include_reserved_in_stock=include_reserved_in_stock,
             grid=sql_grid,
         )
         return {"order_id": order_id, "count": len(rows), "rows": rows}
@@ -896,6 +917,7 @@ def sim_prep(
     service_level: float = Query(default=0.95, gt=0, le=1),
     start_day: date | None = Query(default=None),
     end_day: date | None = Query(default=None),
+    include_reserved_in_stock: bool = Query(default=False),
     authorization: str = Header(default=""),
 ) -> list[dict[str, Any]]:
     require_request_user(authorization, db_name)
@@ -910,6 +932,7 @@ def sim_prep(
                 start_day=start_day,
                 end_day=end_day,
                 database=db_name,
+                include_reserved_in_stock=include_reserved_in_stock,
             )
         except Exception as extra:
             return item_id, extra
@@ -1325,6 +1348,7 @@ def list_rows(
     limit: int = Query(default=100, ge=1, le=20000),
     offset: int = Query(default=0, ge=0),
     stock_out: bool = Query(default=False),
+    include_reserved_in_stock: bool = Query(default=False),
     sql_grid: str | None = Query(default="catalog", alias="sqlGrid"),
     authorization: str = Header(default=""),
 ) -> dict[str, Any]:
@@ -1336,6 +1360,7 @@ def list_rows(
             offset=offset,
             database=db_name,
             stock_out=stock_out,
+            include_reserved_in_stock=include_reserved_in_stock,
             grid=sql_grid,
         )
         return {"table": table_name, "count": len(rows), "rows": rows}

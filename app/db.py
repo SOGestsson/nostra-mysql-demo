@@ -675,6 +675,7 @@ def list_rows(
     offset: int,
     database: str | None = None,
     stock_out: bool = False,
+    include_reserved_in_stock: bool = False,
     grid: str | None = "catalog",
 ) -> list[dict[str, Any]]:
     with connection(database) as conn:
@@ -688,7 +689,10 @@ def list_rows(
             select = f"SELECT {_item_override_select_fields()} FROM items {join}"
             item_cols = {column.name for column in get_columns(conn, "items")}
             if stock_out:
-                where = append_sql_filter(_sql_stock_out_predicate(item_cols), sql_filter)
+                where = append_sql_filter(
+                    _sql_stock_out_predicate(item_cols, include_reserved=include_reserved_in_stock),
+                    sql_filter,
+                )
                 query = f"{select} {where}"
                 params: tuple = ()
             else:
@@ -698,6 +702,8 @@ def list_rows(
             with conn.cursor(dictionary=True) as cursor:
                 cursor.execute(query, params)
                 rows = cursor.fetchall()
+            _attach_suggestion_purchase_qty(conn, rows)
+            _attach_latest_order_line(conn, rows)
             return [_normalize_item_row(row) for row in rows]
         else:
             if stock_out:
@@ -845,6 +851,7 @@ def get_sim_input_data(
     start_day: date | None = None,
     end_day: date | None = None,
     database: str | None = None,
+    include_reserved_in_stock: bool = False,
 ) -> dict[str, Any]:
     if number_of_days < 1:
         raise ValueError("number_of_days must be at least 1")
@@ -857,7 +864,7 @@ def get_sim_input_data(
         item = _fetch_item_with_overrides_conn(conn, item_id, database)
         if not item:
             raise ValueError(f"Item not found: {item_id}")
-        _resolve_item_stock_row(item)
+        _resolve_item_stock_row(item, include_reserved=include_reserved_in_stock)
 
         item_number = item.get("item_number") or ""
         history_rows = _fetch_item_history_sales(conn, database, item_id, item_number)
@@ -1443,9 +1450,18 @@ def _sql_effective_stock_level(item_cols: set[str]) -> str:
     return _sql_item_col(item_cols, stock)
 
 
-def _sql_stock_out_predicate(item_cols: set[str], table_prefix: str = "items") -> str:
+def _sql_stock_out_predicate(
+    item_cols: set[str],
+    table_prefix: str = "items",
+    *,
+    include_reserved: bool = False,
+) -> str:
     live = f"{table_prefix}.{_sql_quote_identifier('live_avail_qty')}"
+    reserved = f"{table_prefix}.{_sql_quote_identifier('live_reserved_qty')}"
     stock = f"{table_prefix}.{_sql_quote_identifier('stock_level')}"
+    if include_reserved and "live_avail_qty" in item_cols and "live_reserved_qty" in item_cols:
+        expr = f"COALESCE({live}, 0) + COALESCE({reserved}, 0)"
+        return f"WHERE {expr} <= 0"
     if "live_avail_qty" in item_cols:
         parts = [live]
         if "stock_level" in item_cols:
@@ -1620,6 +1636,102 @@ def _order_items_select_sql(vendor_override_days: int, item_fields: str) -> str:
             """
 
 
+def _attach_suggestion_purchase_qty(conn: MySQLConnection, rows: list[dict[str, Any]]) -> None:
+    """Latest order qty after the current suggestion, so a shortfall can ignore buy_freq."""
+    for row in rows:
+        row["last_order_qty_suggested"] = None
+        row["last_order_qty_purchased"] = None
+    if not rows or not _table_exists(conn, "order_lines") or not _table_exists(conn, "orders"):
+        return
+    item_ids = [
+        int(row["id"])
+        for row in rows
+        if row.get("id") is not None and row.get("purch_sugg_creation_date")
+    ]
+    if not item_ids:
+        return
+    placeholders = ",".join(["%s"] * len(item_ids))
+    with conn.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                ol.item_id,
+                ol.qty_suggested AS last_order_qty_suggested,
+                COALESCE(ol.qty_override, ol.qty_suggested) AS last_order_qty_purchased
+            FROM order_lines ol
+            INNER JOIN (
+                SELECT order_lines.item_id, MAX(order_lines.id) AS line_id
+                FROM order_lines
+                INNER JOIN items ON items.id = order_lines.item_id
+                INNER JOIN orders ON orders.id = order_lines.order_id
+                WHERE COALESCE(order_lines.deleted, 0) = 0
+                  AND order_lines.item_id IN ({placeholders})
+                  AND items.purch_sugg_creation_date IS NOT NULL
+                  AND DATE(COALESCE(orders.order_date, order_lines.order_date))
+                        >= DATE(items.purch_sugg_creation_date)
+                GROUP BY order_lines.item_id
+            ) latest ON latest.line_id = ol.id
+            """,
+            tuple(item_ids),
+        )
+        by_item = {int(line["item_id"]): line for line in cursor.fetchall() if line.get("item_id") is not None}
+    for row in rows:
+        item_id = row.get("id")
+        line = by_item.get(int(item_id)) if item_id is not None else None
+        if not line:
+            continue
+        row["last_order_qty_suggested"] = line.get("last_order_qty_suggested")
+        row["last_order_qty_purchased"] = line.get("last_order_qty_purchased")
+
+
+def _attach_latest_order_line(conn: MySQLConnection, rows: list[dict[str, Any]]) -> None:
+    """Absolute latest order line per item, for the shortfall / do-not-purchase KPI."""
+    for row in rows:
+        row["last_line_id"] = None
+        row["last_line_order_id"] = None
+        row["last_line_qty_suggested"] = None
+        row["last_line_qty_override"] = None
+        row["last_line_progress"] = None
+    if not rows or not _table_exists(conn, "order_lines"):
+        return
+    item_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+    if not item_ids:
+        return
+    placeholders = ",".join(["%s"] * len(item_ids))
+    with conn.cursor(dictionary=True) as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                ol.item_id,
+                ol.id AS last_line_id,
+                ol.order_id AS last_line_order_id,
+                ol.qty_suggested AS last_line_qty_suggested,
+                ol.qty_override AS last_line_qty_override,
+                ol.progress AS last_line_progress
+            FROM order_lines ol
+            INNER JOIN (
+                SELECT item_id, MAX(id) AS line_id
+                FROM order_lines
+                WHERE COALESCE(deleted, 0) = 0
+                  AND item_id IN ({placeholders})
+                GROUP BY item_id
+            ) latest ON latest.line_id = ol.id
+            """,
+            tuple(item_ids),
+        )
+        by_item = {int(line["item_id"]): line for line in cursor.fetchall() if line.get("item_id") is not None}
+    for row in rows:
+        item_id = row.get("id")
+        line = by_item.get(int(item_id)) if item_id is not None else None
+        if not line:
+            continue
+        row["last_line_id"] = line.get("last_line_id")
+        row["last_line_order_id"] = line.get("last_line_order_id")
+        row["last_line_qty_suggested"] = line.get("last_line_qty_suggested")
+        row["last_line_qty_override"] = line.get("last_line_qty_override")
+        row["last_line_progress"] = line.get("last_line_progress")
+
+
 def _table_exists(conn: MySQLConnection, table_name: str) -> bool:
     with conn.cursor() as cursor:
         cursor.execute("SHOW TABLES LIKE %s", (table_name,))
@@ -1678,6 +1790,7 @@ def list_order_items(
     offset: int = 0,
     order_lines_only: bool = True,
     stock_out: bool = False,
+    include_reserved_in_stock: bool = False,
     grid: str | None = None,
 ) -> list[dict[str, Any]]:
     with connection(database) as conn:
@@ -1713,7 +1826,10 @@ def list_order_items(
             item_cols = {column.name for column in get_columns(conn, "items")}
             stock_filter = ""
             if stock_out:
-                stock_filter = " AND " + _sql_stock_out_predicate(item_cols).removeprefix("WHERE ")
+                stock_filter = " AND " + _sql_stock_out_predicate(
+                    item_cols,
+                    include_reserved=include_reserved_in_stock,
+                ).removeprefix("WHERE ")
             where_clause = append_sql_filter(f"WHERE 1=1{stock_filter}", sql_filter)
             query = select_sql.format(
                 from_clause="""
@@ -1735,6 +1851,44 @@ def list_order_items(
             raise
         _attach_alternative_parts(conn, [row for row in rows if row])
         return rows
+
+
+def list_order_lines_by_ids(
+    line_ids: list[int],
+    database: str | None = None,
+) -> list[dict[str, Any]]:
+    ids = sorted({int(line_id) for line_id in line_ids if line_id is not None})
+    if not ids:
+        return []
+    with connection(database) as conn:
+        ensure_table_exists(conn, "items")
+        _ensure_orders_tables(conn)
+        _ensure_vendor_overrides_table(conn)
+        _ensure_purchasing_method_overrides_table(conn)
+        vendor_override_days = _get_vendor_override_days(database)
+        item_fields = _order_line_display_item_fields(conn)
+        select_sql = _order_items_select_sql(vendor_override_days, item_fields)
+        rows: list[dict[str, Any]] = []
+        chunk_size = 1000
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            placeholders = ",".join(["%s"] * len(chunk))
+            where_clause = (
+                f"WHERE order_lines.id IN ({placeholders})"
+                " AND COALESCE(order_lines.deleted, 0) = 0"
+            )
+            query = select_sql.format(
+                from_clause="""
+            order_lines
+            INNER JOIN orders ON orders.id = order_lines.order_id
+            LEFT JOIN items ON items.id = order_lines.item_id""",
+                where_clause=where_clause,
+                order_clause="ORDER BY order_lines.id",
+            )
+            rows.extend(_get_rows(conn, query, (*chunk, len(chunk), 0)))
+        normalized = [_normalize_item_row(row) for row in rows]
+        _attach_alternative_parts(conn, [row for row in normalized if row])
+        return normalized
 
 
 def _normalize_item_number(item_number: str | None) -> str:
@@ -2972,13 +3126,25 @@ def run_roi_point_estimate(
     return result
 
 
-def _resolve_item_stock_row(row: dict[str, Any]) -> dict[str, Any]:
-    """When live_avail_qty exists, treat it as canonical stock in stock_level."""
-    if not row or "live_avail_qty" not in row:
+def effective_stock_qty(row: dict[str, Any], *, include_reserved: bool = False) -> float:
+    """ERP available qty, optionally plus live_reserved_qty; else stock_level."""
+    if not row:
+        return 0.0
+    if row.get("live_avail_qty") is not None:
+        qty = _to_number(row.get("live_avail_qty"), default=0)
+    else:
+        qty = _to_number(row.get("stock_level"), default=0)
+    if include_reserved:
+        qty += _to_number(row.get("live_reserved_qty"), default=0)
+    return qty
+
+
+def _resolve_item_stock_row(row: dict[str, Any], *, include_reserved: bool = False) -> dict[str, Any]:
+    """Map live ERP qty (+ optional reserved) into stock_level for sim/UI."""
+    if not row:
         return row
-    live = row.get("live_avail_qty")
-    if live is not None:
-        row["stock_level"] = live
+    if "live_avail_qty" in row or include_reserved:
+        row["stock_level"] = effective_stock_qty(row, include_reserved=include_reserved)
     return row
 
 
