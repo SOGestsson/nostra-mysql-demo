@@ -11,7 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app import db, auth as auth_module, forecast as forecast_module, ui_config as ui_config_module, assistant as assistant_module
-from app.m7_schema import CREATE_TABLES, LiveDatabaseRefused, assert_m7_database_allowed
+from app.m7_schema import (
+    CREATE_TABLES,
+    LiveDatabaseRefused,
+    assert_m7_database_allowed,
+    replace_m7_forecast,
+)
 from app.security import check_login_rate, client_ip, cors_allow_origins, docs_enabled, require_request_user
 
 logger = logging.getLogger(__name__)
@@ -555,6 +560,36 @@ def m7_status(
         "detail": "M7 tables are not created by this request.",
         "tables": list(CREATE_TABLES),
     }
+
+
+class M7ForecastReplaceBody(BaseModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@app.post("/m7/forecast/replace")
+def m7_forecast_replace(
+    payload: M7ForecastReplaceBody,
+    db_name: str = Query(..., alias="db"),
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    """Replace m7_forecast months for the items in one request.
+
+    Deletes existing rows for those item numbers, then inserts the new months.
+    Live purchasing databases are refused.
+    """
+    require_request_user(authorization, db_name)
+    try:
+        assert_m7_database_allowed(db_name)
+    except LiveDatabaseRefused as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    try:
+        with db.connection(db_name) as conn:
+            counts = replace_m7_forecast(conn, payload.rows)
+        return {"database": db_name, **counts}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except mysql.connector.Error as exc:
+        raise HTTPException(status_code=500, detail=exc.msg) from exc
 
 
 @app.get("/databases")
