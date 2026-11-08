@@ -13,6 +13,19 @@ ENGINE_TIMEOUT = float(os.getenv("FORECAST_API_TIMEOUT", "120"))
 
 GENERATE_PATH = "/api/v1/forecast/generate"
 
+
+def _engine_headers() -> dict[str, str]:
+    """X-Api-Key for the forecast engine (nostradamus-api).
+
+    Must match API_KEY on nostradamus-api (same value as SIM_API_KEY on the
+    pipeline gateway). Required once partner keys (API_KEYS) are configured there,
+    since the forecast routes then reject unauthenticated calls. Read per call so a
+    late `load_dotenv()` still takes effect.
+    """
+    key = (os.getenv("FORECAST_API_KEY") or "").strip()
+    return {"X-Api-Key": key} if key else {}
+
+
 SUPPORTED_MODELS = [
     "auto_model",
     "auto_arima",
@@ -49,7 +62,7 @@ def validate_model(local_model: str, mode: str) -> None:
 def generate(payload: dict[str, Any]) -> dict[str, Any]:
     url = f"{ENGINE_URL.rstrip('/')}{GENERATE_PATH}"
     try:
-        response = httpx.post(url, json=payload, timeout=ENGINE_TIMEOUT)
+        response = httpx.post(url, json=payload, headers=_engine_headers(), timeout=ENGINE_TIMEOUT)
     except httpx.TimeoutException as exc:
         raise ForecastEngineError(
             f"Forecast engine timed out after {ENGINE_TIMEOUT}s", status_code=504

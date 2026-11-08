@@ -37,6 +37,11 @@ if [ -n "$ASSISTANT_PROVIDER" ]; then
   LLM_ENV="$LLM_ENV -e ASSISTANT_PROVIDER=$ASSISTANT_PROVIDER"
 fi
 
+if [ -z "${FORECAST_API_KEY:-}" ]; then
+  echo "AÐVÖRUN: FORECAST_API_KEY er ekki sett. Spáköll db-api fá 401 ef API_KEYS er" >&2
+  echo "         virkt á nostradamus-api. Notaðu sama gildi og API_KEY þar." >&2
+fi
+
 echo "==> Build and push db-api…"
 docker buildx build --platform linux/arm64 -t "$IMAGE" --push .
 
@@ -61,6 +66,7 @@ REMOTE_CMD="
     -e JWT_SECRET=$JWT_SECRET \
     -e FORECAST_API_URL=${FORECAST_API_URL:-https://api.nostradamus-api.com} \
     -e FORECAST_API_TIMEOUT=${FORECAST_API_TIMEOUT:-120} \
+    -e FORECAST_API_KEY='${FORECAST_API_KEY:-}' \
     -e ENABLE_DOCS=true \
     $OPENCLAW_ENV \
     $LLM_ENV \
