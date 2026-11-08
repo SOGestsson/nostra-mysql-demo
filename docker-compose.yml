@@ -19,4 +19,5 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       FORECAST_API_URL: ${FORECAST_API_URL:-https://api.nostradamus-api.com}
       FORECAST_API_TIMEOUT: ${FORECAST_API_TIMEOUT:-120}
+      FORECAST_API_KEY: ${FORECAST_API_KEY:-}
     restart: unless-stopped
